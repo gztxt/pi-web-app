@@ -40,8 +40,6 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
-
 /**
  * Pi Web 安卓客户端 v2.0
  * 基于 github.com/agegr/pi-web 最新源码的配色与图标重构。
@@ -77,7 +75,6 @@ public class MainActivity extends Activity {
 
     private WebView webView;
     private ProgressBar progressBar;
-    private SwipeRefreshLayout swipeLayout;
     private View splashView;
     private TextView splashStatus;
     private TextView fab;
@@ -164,20 +161,10 @@ public class MainActivity extends Activity {
         rootLayout = new FrameLayout(this);
         rootLayout.setBackgroundColor(C_BG);
 
-        // 下拉刷新 + WebView
-        swipeLayout = new SwipeRefreshLayout(this);
-        swipeLayout.setColorSchemeColors(C_ACCENT);
-        swipeLayout.setProgressBackgroundColorSchemeColor(C_PANEL);
-        swipeLayout.setOnRefreshListener(() -> {
-            if (inError) loadPiWeb(); else webView.reload();
-        });
-
+        // WebView(v2.1: 移除下拉刷新,避免与页面滚动冲突;刷新走 π 菜单)
         webView = new WebView(this);
         webView.setBackgroundColor(C_BG);
-        swipeLayout.addView(webView,
-            new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT));
-        rootLayout.addView(swipeLayout,
+        rootLayout.addView(webView,
             new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
 
@@ -380,7 +367,6 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 progressBar.setVisibility(View.GONE);
-                swipeLayout.setRefreshing(false);
                 // 关键修复: 只有真实页面成功加载才切换状态,
                 // 错误页(piweb.error)与中间页不会覆盖错误状态
                 if (!pageError && isRealPage(url)) {
@@ -463,7 +449,6 @@ public class MainActivity extends Activity {
         handler.removeCallbacksAndMessages(null);
         inError = false;
         pageError = false;
-        swipeLayout.setRefreshing(false);
         if (!firstLoadDone) {
             splashStatus.setText("正在连接 " + briefHost(serverUrl) + " …");
             splashView.setVisibility(View.VISIBLE);
@@ -475,7 +460,6 @@ public class MainActivity extends Activity {
         inError = true;
         handler.removeCallbacksAndMessages(null);
         progressBar.setVisibility(View.GONE);
-        swipeLayout.setRefreshing(false);
         splashView.setVisibility(View.GONE);
 
         String html = errorHtml(serverUrl, detail);

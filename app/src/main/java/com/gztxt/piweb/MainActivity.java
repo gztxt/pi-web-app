@@ -37,6 +37,7 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -56,6 +57,7 @@ import android.widget.Toast;
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_URL = "http://100.117.232.62:30141";
+    private static final String APP_VERSION = "2.2";
     private static final String PREFS = "piweb_prefs";
     private static final String PREF_URL = "server_url";
     private static final String PREF_DESKTOP = "desktop_mode";
@@ -99,6 +101,7 @@ public class MainActivity extends Activity {
             if (!inError) return;
             countdown--;
             if (countdown <= 0) {
+                AppLog.i("Retry", "倒计时结束,自动重试");
                 loadPiWeb();
                 return;
             }
@@ -113,6 +116,7 @@ public class MainActivity extends Activity {
         @Override
         public void onReceive(Context context, Intent intent) {
             if (inError && isNetworkAvailable()) {
+                AppLog.i("Net", "网络恢复,自动重连");
                 toast("网络已恢复,重新连接…");
                 loadPiWeb();
             }
@@ -126,6 +130,12 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         serverUrl = prefs.getString(PREF_URL, DEFAULT_URL);
         desktopMode = prefs.getBoolean(PREF_DESKTOP, false);
+
+        AppLog.init(getApplicationContext());
+        AppLog.installCrashHandler();
+        AppLog.i("App", "==== 启动 v" + APP_VERSION + " | Android " + Build.VERSION.RELEASE
+            + " (API " + Build.VERSION.SDK_INT + ") | " + Build.MANUFACTURER + " " + Build.MODEL + " ====");
+        AppLog.i("App", "地址: " + serverUrl + " | 桌面模式: " + desktopMode);
 
         // 刘海屏延伸到内容区(API 28+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -356,6 +366,7 @@ public class MainActivity extends Activity {
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 pageError = false;
                 if (isRealPage(url)) {
+                    AppLog.i("Page", "开始加载 " + url);
                     progressBar.setVisibility(View.VISIBLE);
                     if (!firstLoadDone) {
                         splashStatus.setText("正在连接 " + briefHost(url) + " …");
@@ -370,6 +381,7 @@ public class MainActivity extends Activity {
                 // 关键修复: 只有真实页面成功加载才切换状态,
                 // 错误页(piweb.error)与中间页不会覆盖错误状态
                 if (!pageError && isRealPage(url)) {
+                    AppLog.i("Page", "加载完成 " + url);
                     boolean wasFirst = !firstLoadDone;
                     firstLoadDone = true;
                     inError = false;
@@ -385,6 +397,8 @@ public class MainActivity extends Activity {
                 if (!request.isForMainFrame()) return;
                 pageError = true;
                 CharSequence desc = error.getDescription();
+                AppLog.e("Load", "主框架加载失败 code=" + error.getErrorCode()
+                    + " desc=" + desc + " url=" + request.getUrl());
                 showErrorPage("网络错误 " + error.getErrorCode()
                     + (desc != null ? " · " + desc : ""));
             }
@@ -396,6 +410,7 @@ public class MainActivity extends Activity {
                 int code = errorResponse.getStatusCode();
                 if (code >= 500) {
                     pageError = true;
+                    AppLog.e("Load", "HTTP " + code + " url=" + request.getUrl());
                     showErrorPage("服务器错误 HTTP " + code);
                 }
             }
@@ -412,6 +427,7 @@ public class MainActivity extends Activity {
             @Override
             public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
                                              FileChooserParams params) {
+                AppLog.i("File", "打开文件选择器");
                 if (uploadCallback != null) uploadCallback.onReceiveValue(null);
                 uploadCallback = callback;
                 try {
@@ -449,6 +465,7 @@ public class MainActivity extends Activity {
         handler.removeCallbacksAndMessages(null);
         inError = false;
         pageError = false;
+        AppLog.i("Load", "加载 " + serverUrl);
         if (!firstLoadDone) {
             splashStatus.setText("正在连接 " + briefHost(serverUrl) + " …");
             splashView.setVisibility(View.VISIBLE);
@@ -459,6 +476,7 @@ public class MainActivity extends Activity {
     private void showErrorPage(String detail) {
         inError = true;
         handler.removeCallbacksAndMessages(null);
+        AppLog.w("Page", "错误页: " + detail + " | url=" + serverUrl);
         progressBar.setVisibility(View.GONE);
         splashView.setVisibility(View.GONE);
 
@@ -515,7 +533,7 @@ public class MainActivity extends Activity {
 
     private void openMenu() {
         String desktopLabel = desktopMode ? "桌面模式: 开 → 关" : "桌面模式: 关 → 开";
-        String[] items = {"刷新页面", "修改服务器地址", desktopLabel, "在浏览器打开", "关于"};
+        String[] items = {"刷新页面", "修改服务器地址", "运行日志", desktopLabel, "在浏览器打开", "关于"};
         new AlertDialog.Builder(this)
             .setTitle("Pi Web")
             .setItems(items, (dialog, which) -> {
@@ -527,25 +545,71 @@ public class MainActivity extends Activity {
                         openUrlDialog();
                         break;
                     case 2:
+                        openLogDialog();
+                        break;
+                    case 3:
                         desktopMode = !desktopMode;
                         prefs.edit().putBoolean(PREF_DESKTOP, desktopMode).apply();
                         applyUserAgent();
+                        AppLog.i("Mode", "桌面模式: " + (desktopMode ? "开" : "关"));
                         loadPiWeb();
                         toast(desktopMode ? "已切换到桌面版页面" : "已切换到移动版页面");
                         break;
-                    case 3:
+                    case 4:
                         try {
                             startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(serverUrl)));
                         } catch (Exception e) {
                             toast("没有可用的浏览器");
                         }
                         break;
-                    case 4:
+                    case 5:
                         showAbout();
                         break;
                 }
             })
             .show();
+    }
+
+    /** 运行日志查看: 最近 400 行,支持分享(文本)与清空。 */
+    private void openLogDialog() {
+        AppLog.i("Log", "查看运行日志");
+        TextView content = new TextView(this);
+        content.setText(AppLog.dump());
+        content.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        content.setTextColor(C_TEXT);
+        content.setTypeface(Typeface.MONOSPACE);
+        content.setTextIsSelectable(true);
+        int pad = dp(12);
+        content.setPadding(pad, pad, pad, pad);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(content, new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT));
+
+        new AlertDialog.Builder(this)
+            .setTitle("运行日志(" + AppLog.size() + " 行)")
+            .setView(scroll)
+            .setPositiveButton("分享", (dialog, which) -> shareLog())
+            .setNeutralButton("清空", (dialog, which) -> {
+                AppLog.clear();
+                toast("日志已清空");
+            })
+            .setNegativeButton("关闭", null)
+            .show();
+    }
+
+    private void shareLog() {
+        Intent send = new Intent(Intent.ACTION_SEND);
+        send.setType("text/plain");
+        send.putExtra(Intent.EXTRA_SUBJECT, "Pi Web 运行日志");
+        send.putExtra(Intent.EXTRA_TEXT,
+            "Pi Web v" + APP_VERSION + " 运行日志 | " + serverUrl + "\n\n" + AppLog.dump());
+        try {
+            startActivity(Intent.createChooser(send, "分享日志"));
+        } catch (Exception e) {
+            AppLog.w("Log", "分享失败: " + e);
+            toast("无可用分享目标");
+        }
     }
 
     /**
@@ -584,6 +648,7 @@ public class MainActivity extends Activity {
                 }
                 serverUrl = normalized;
                 prefs.edit().putString(PREF_URL, serverUrl).apply();
+                AppLog.i("Config", "地址变更 → " + serverUrl);
                 firstLoadDone = false;
                 loadPiWeb();
             })
@@ -594,10 +659,11 @@ public class MainActivity extends Activity {
     private void showAbout() {
         new AlertDialog.Builder(this)
             .setTitle("关于")
-            .setMessage("Pi Web 安卓客户端 v2.0\n"
+            .setMessage("Pi Web 安卓客户端 v" + APP_VERSION + "\n"
                 + "基于 github.com/agegr/pi-web 最新源码重构\n\n"
                 + "当前地址: " + serverUrl + "\n"
-                + "页面模式: " + (desktopMode ? "桌面版" : "移动版"))
+                + "页面模式: " + (desktopMode ? "桌面版" : "移动版") + "\n"
+                + "日志文件: " + AppLog.filePath())
             .setPositiveButton("确定", null)
             .show();
     }
@@ -666,6 +732,7 @@ public class MainActivity extends Activity {
             if (resultCode == RESULT_OK) {
                 results = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
             }
+            AppLog.i("File", "选择结果: " + (results == null ? 0 : results.length) + " 个文件");
             if (uploadCallback != null) {
                 uploadCallback.onReceiveValue(results);
                 uploadCallback = null;

@@ -3,6 +3,14 @@
 WebView 壳 APP,把 [pi-web](https://github.com/agegr/pi-web)(pi coding agent 的 Web 工作台)封装为安卓原生应用。
 v2.0 基于 pi-web 最新源码的官方图标与暗色配色(`#1a1a1a` / `#60a5fa`)重构。
 
+## v2.2 更新
+
+**新增**
+- 📝 **运行日志**:启动/加载/错误/重试/网络变化/配置变更/文件选择全链路记录
+  - π 菜单 → 运行日志:查看最近 400 行 / 分享文本 / 清空
+  - 持久化 `files/piweb.log`(256KB 自动轮转),镜像 logcat(`adb logcat -s PiWeb`)
+  - 全局崩溃捕获:闪退/黑屏先落盘堆栈再退出,事后可查
+
 ## v2.1 更新
 
 **修复**

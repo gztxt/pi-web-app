@@ -57,7 +57,7 @@ import android.widget.Toast;
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_URL = "http://100.117.232.62:30141";
-    private static final String APP_VERSION = "2.2";
+    private static final String APP_VERSION = "2.4";
     private static final String PREFS = "piweb_prefs";
     private static final String PREF_URL = "server_url";
     private static final String PREF_DESKTOP = "desktop_mode";
@@ -95,6 +95,11 @@ public class MainActivity extends Activity {
 
     private ValueCallback<Uri[]> uploadCallback;
 
+    // v2.4 诊断状态
+    private boolean diagPending = false;   // 错误页渲染完成后自动诊断
+    private boolean diagRunning = false;   // 防止并发诊断
+    private TextView diagDialogText;       // 菜单诊断对话框实时输出
+
     private final Runnable countdownTick = new Runnable() {
         @Override
         public void run() {
@@ -102,7 +107,7 @@ public class MainActivity extends Activity {
             countdown--;
             if (countdown <= 0) {
                 AppLog.i("Retry", "倒计时结束,自动重试");
-                loadPiWeb();
+                loadPiWeb("auto");
                 return;
             }
             webView.evaluateJavascript(
@@ -115,10 +120,13 @@ public class MainActivity extends Activity {
     private final BroadcastReceiver networkReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (inError && isNetworkAvailable()) {
-                AppLog.i("Net", "网络恢复,自动重连");
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            NetworkInfo info = cm == null ? null : cm.getActiveNetworkInfo();
+            boolean up = info != null && info.isConnected();
+            AppLog.i("Net", "网络状态变化: " + (up ? "已连接(" + info.getTypeName() + ")" : "断开"));
+            if (inError && up) {
                 toast("网络已恢复,重新连接…");
-                loadPiWeb();
+                loadPiWeb("net");
             }
         }
     };
@@ -162,7 +170,7 @@ public class MainActivity extends Activity {
             prefs.edit().putBoolean(PREF_HINT, true).apply();
         }
 
-        loadPiWeb();
+        loadPiWeb("launch");
     }
 
     // ---------------------------------------------------------------- 布局
@@ -344,8 +352,9 @@ public class MainActivity extends Activity {
                 switch (scheme) {
                     case "piweb":
                         String host = uri.getHost();
-                        if ("retry".equals(host)) loadPiWeb();
+                        if ("retry".equals(host)) loadPiWeb("manual");
                         else if ("settings".equals(host)) openUrlDialog();
+                        else if ("diag".equals(host)) runDiagnostics();
                         return true;
                     case "http":
                     case "https":
@@ -378,6 +387,14 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 progressBar.setVisibility(View.GONE);
+                // 错误页渲染完成 → 触发自动诊断(v2.4)
+                if (url.startsWith(ERROR_BASE)) {
+                    if (diagPending) {
+                        diagPending = false;
+                        runDiagnostics();
+                    }
+                    return;
+                }
                 // 关键修复: 只有真实页面成功加载才切换状态,
                 // 错误页(piweb.error)与中间页不会覆盖错误状态
                 if (!pageError && isRealPage(url)) {
@@ -461,11 +478,11 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- 加载
 
-    private void loadPiWeb() {
+    private void loadPiWeb(String trigger) {
         handler.removeCallbacksAndMessages(null);
         inError = false;
         pageError = false;
-        AppLog.i("Load", "加载 " + serverUrl);
+        AppLog.i("Load", "加载 " + serverUrl + " (trigger=" + trigger + ")");
         if (!firstLoadDone) {
             splashStatus.setText("正在连接 " + briefHost(serverUrl) + " …");
             splashView.setVisibility(View.VISIBLE);
@@ -477,6 +494,7 @@ public class MainActivity extends Activity {
         inError = true;
         handler.removeCallbacksAndMessages(null);
         AppLog.w("Page", "错误页: " + detail + " | url=" + serverUrl);
+        diagPending = true;
         progressBar.setVisibility(View.GONE);
         splashView.setVisibility(View.GONE);
 
@@ -511,6 +529,9 @@ public class MainActivity extends Activity {
             + "text-decoration:none;font-size:14px;font-weight:500}"
             + ".primary{background:#2563eb;color:#fff}"
             + ".ghost{background:#242424;color:#e8e8e8;border:1px solid #3a3a3a}"
+            + ".diag{text-align:left;font-size:11px;line-height:1.7;color:#9ca3af;background:#242424;"
+            + "border:1px solid #3a3a3a;border-radius:10px;padding:10px 12px;margin:0 0 16px;"
+            + "white-space:pre-wrap;word-break:break-all;font-family:monospace}"
             + ".cd{font-size:12px;color:#6b7280;margin-top:16px}"
             + "</style></head><body><div class=\"card\">"
             + "<div class=\"logo\">π</div>"
@@ -523,8 +544,10 @@ public class MainActivity extends Activity {
             + "<li>确认服务器正在运行 <code>pi-web</code></li>"
             + "<li>IPv6 请用方括号: <code>http://[2001:db8::1]:30141</code></li>"
             + "</ul>"
+            + "<pre class=\"diag\" id=\"diag\">诊断中…\n</pre>"
             + "<a class=\"btn primary\" href=\"piweb://retry\">立即重试</a>"
             + "<a class=\"btn ghost\" href=\"piweb://settings\">修改地址</a>"
+            + "<a class=\"btn ghost\" href=\"piweb://diag\">重新诊断</a>"
             + "<div class=\"cd\"><span id=\"cd\">" + AUTO_RETRY_SECONDS + "</span> 秒后自动重试…</div>"
             + "</div></body></html>";
     }
@@ -533,13 +556,13 @@ public class MainActivity extends Activity {
 
     private void openMenu() {
         String desktopLabel = desktopMode ? "桌面模式: 开 → 关" : "桌面模式: 关 → 开";
-        String[] items = {"刷新页面", "修改服务器地址", "运行日志", desktopLabel, "在浏览器打开", "关于"};
+        String[] items = {"刷新页面", "修改服务器地址", "运行日志", "网络诊断", desktopLabel, "在浏览器打开", "关于"};
         new AlertDialog.Builder(this)
             .setTitle("Pi Web")
             .setItems(items, (dialog, which) -> {
                 switch (which) {
                     case 0:
-                        loadPiWeb();
+                        loadPiWeb("manual");
                         break;
                     case 1:
                         openUrlDialog();
@@ -548,21 +571,24 @@ public class MainActivity extends Activity {
                         openLogDialog();
                         break;
                     case 3:
+                        openDiagDialog();
+                        break;
+                    case 4:
                         desktopMode = !desktopMode;
                         prefs.edit().putBoolean(PREF_DESKTOP, desktopMode).apply();
                         applyUserAgent();
                         AppLog.i("Mode", "桌面模式: " + (desktopMode ? "开" : "关"));
-                        loadPiWeb();
+                        loadPiWeb("mode");
                         toast(desktopMode ? "已切换到桌面版页面" : "已切换到移动版页面");
                         break;
-                    case 4:
+                    case 5:
                         try {
                             startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(serverUrl)));
                         } catch (Exception e) {
                             toast("没有可用的浏览器");
                         }
                         break;
-                    case 5:
+                    case 6:
                         showAbout();
                         break;
                 }
@@ -612,6 +638,87 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------------------------------------------------------------- 诊断
+
+    /**
+     * 分层诊断入口(v2.4)。错误页自动触发(diagPending),π 菜单可手动触发。
+     * 结果三路输出: 错误页实时注入 / 诊断对话框 / AppLog。
+     */
+    private void runDiagnostics() {
+        if (diagRunning) {
+            toast("诊断进行中…");
+            return;
+        }
+        diagRunning = true;
+        AppLog.i("Diag", "==== 开始诊断 " + serverUrl + " ====");
+        if (inError) {
+            webView.evaluateJavascript(
+                "(function(){var e=document.getElementById('diag');if(e)e.textContent='';})();",
+                null);
+        }
+        final boolean networkUp = isNetworkAvailable();
+        Diag.run(serverUrl, networkUp, new Diag.Callback() {
+            @Override
+            public void onLine(final String line) {
+                runOnUiThread(() -> onDiagLine(line));
+            }
+
+            @Override
+            public void onDone(final String verdict) {
+                runOnUiThread(() -> {
+                    diagRunning = false;
+                    onDiagDone(verdict);
+                });
+            }
+        });
+    }
+
+    private void onDiagLine(String line) {
+        AppLog.i("Diag", line);
+        if (inError) injectDiag(line);
+        if (diagDialogText != null) diagDialogText.append(line).append("\n");
+    }
+
+    private void onDiagDone(String verdict) {
+        if (verdict.contains("全链路正常")) AppLog.i("Diag", verdict);
+        else AppLog.w("Diag", verdict);
+        if (inError) injectDiag("── " + verdict);
+        if (diagDialogText != null) diagDialogText.append("\n").append(verdict).append("\n");
+    }
+
+    private void injectDiag(String line) {
+        webView.evaluateJavascript(
+            "(function(){var e=document.getElementById('diag');if(e)e.textContent+='"
+                + jsEscape(line) + "\\n';})();",
+            null);
+    }
+
+    private static String jsEscape(String s) {
+        return s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ");
+    }
+
+    /** π 菜单 → 网络诊断: 非错误态时的实时结果对话框。 */
+    private void openDiagDialog() {
+        TextView content = new TextView(this);
+        content.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        content.setTextColor(C_TEXT);
+        content.setTypeface(Typeface.MONOSPACE);
+        int pad = dp(14);
+        content.setPadding(pad, pad, pad, pad);
+        content.setText("诊断中…\n");
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(content, new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT));
+        diagDialogText = content;
+        new AlertDialog.Builder(this)
+            .setTitle("网络诊断")
+            .setView(scroll)
+            .setOnDismissListener(d -> diagDialogText = null)
+            .setNegativeButton("关闭", null)
+            .show();
+        runDiagnostics();
+    }
+
     /**
      * 修改服务器地址。
      * 支持: IPv4(http://192.168.1.10:30141)、IPv6 方括号(http://[2001:db8::1]:30141)、
@@ -650,7 +757,7 @@ public class MainActivity extends Activity {
                 prefs.edit().putString(PREF_URL, serverUrl).apply();
                 AppLog.i("Config", "地址变更 → " + serverUrl);
                 firstLoadDone = false;
-                loadPiWeb();
+                loadPiWeb("config");
             })
             .setNegativeButton("取消", null)
             .show();

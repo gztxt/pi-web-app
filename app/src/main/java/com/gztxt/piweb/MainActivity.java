@@ -676,14 +676,21 @@ public class MainActivity extends Activity {
     private void onDiagLine(String line) {
         AppLog.i("Diag", line);
         if (inError) injectDiag(line);
-        if (diagDialogText != null) diagDialogText.append(line).append("\n");
+        if (diagDialogText != null) {
+            diagDialogText.append(line);
+            diagDialogText.append("\n");
+        }
     }
 
     private void onDiagDone(String verdict) {
         if (verdict.contains("全链路正常")) AppLog.i("Diag", verdict);
         else AppLog.w("Diag", verdict);
         if (inError) injectDiag("── " + verdict);
-        if (diagDialogText != null) diagDialogText.append("\n").append(verdict).append("\n");
+        if (diagDialogText != null) {
+            diagDialogText.append("\n");
+            diagDialogText.append(verdict);
+            diagDialogText.append("\n");
+        }
     }
 
     private void injectDiag(String line) {

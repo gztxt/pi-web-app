@@ -33,13 +33,21 @@ import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.ArrayAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Pi Web 安卓客户端 v2.0
@@ -53,13 +61,16 @@ import android.widget.Toast;
  *  - 服务器地址自定义(IPv4 / IPv6 方括号 / 域名),SharedPreferences 持久化
  *  - 启动 Splash、错误页自动重试倒计时、网络恢复自动重连、下拉刷新
  *  - 图片上传(pi-web 聊天附件)、桌面模式切换、可拖动的 π 菜单按钮
+ *  - v2.5 服务器地址簿: 多条目管理(添加/编辑/删除)+ π 菜单顶部一键快切,
+ *    旧地址自动迁移为首条;Pi Web / CCR 控制台等多服务共用一个壳
  */
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_URL = "http://100.117.232.62:30141";
-    private static final String APP_VERSION = "2.4";
+    private static final String APP_VERSION = "2.5";
     private static final String PREFS = "piweb_prefs";
     private static final String PREF_URL = "server_url";
+    private static final String PREF_BOOK = "server_book";
     private static final String PREF_DESKTOP = "desktop_mode";
     private static final String PREF_HINT = "hint_shown";
     private static final String ERROR_BASE = "https://piweb.error/";
@@ -138,12 +149,14 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         serverUrl = prefs.getString(PREF_URL, DEFAULT_URL);
         desktopMode = prefs.getBoolean(PREF_DESKTOP, false);
+        migrateBook();
 
         AppLog.init(getApplicationContext());
         AppLog.installCrashHandler();
         AppLog.i("App", "==== 启动 v" + APP_VERSION + " | Android " + Build.VERSION.RELEASE
             + " (API " + Build.VERSION.SDK_INT + ") | " + Build.MANUFACTURER + " " + Build.MODEL + " ====");
         AppLog.i("App", "地址: " + serverUrl + " | 桌面模式: " + desktopMode);
+        AppLog.i("Book", "地址簿就绪: " + loadBook().size() + " 条");
 
         // 刘海屏延伸到内容区(API 28+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -554,18 +567,40 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- 菜单
 
+    /**
+     * π 菜单(v2.5): 顶部为地址簿快切列表(当前服务 ✓ 标记),
+     * 其下为地址簿管理与常规功能项。
+     */
     private void openMenu() {
-        String desktopLabel = desktopMode ? "桌面模式: 开 → 关" : "桌面模式: 关 → 开";
-        String[] items = {"刷新页面", "修改服务器地址", "运行日志", "网络诊断", desktopLabel, "在浏览器打开", "关于"};
+        final List<BookEntry> book = loadBook();
+        final List<String> items = new ArrayList<>();
+        for (BookEntry e : book) {
+            items.add((e.url.equals(serverUrl) ? "✓ " : "     ") + e.name);
+        }
+        items.add("────────────");
+        final int bookManageIndex = items.size();
+        items.add("服务器地址簿…");
+        items.add("刷新页面");
+        items.add("运行日志");
+        items.add("网络诊断");
+        items.add(desktopMode ? "桌面模式: 开 → 关" : "桌面模式: 关 → 开");
+        items.add("在浏览器打开");
+        items.add("关于");
+
         new AlertDialog.Builder(this)
-            .setTitle("Pi Web")
-            .setItems(items, (dialog, which) -> {
-                switch (which) {
-                    case 0:
+            .setTitle("Pi Web · " + currentServiceName(book))
+            .setItems(items.toArray(new String[0]), (dialog, which) -> {
+                if (which < book.size()) {
+                    switchTo(book.get(which), "menu");
+                    return;
+                }
+                if (which == bookManageIndex) {
+                    openBookDialog();
+                    return;
+                }
+                switch (which - bookManageIndex) {
+                    case 1: // 刷新页面
                         loadPiWeb("manual");
-                        break;
-                    case 1:
-                        openUrlDialog();
                         break;
                     case 2:
                         openLogDialog();
@@ -591,9 +626,16 @@ public class MainActivity extends Activity {
                     case 6:
                         showAbout();
                         break;
+                    default:
+                        break; // 分隔线,忽略
                 }
             })
             .show();
+    }
+
+    private String currentServiceName(List<BookEntry> book) {
+        int idx = bookIndexOf(book, serverUrl);
+        return idx >= 0 ? book.get(idx).name : briefHost(serverUrl);
     }
 
     /** 运行日志查看: 最近 400 行,支持分享(文本)与清空。 */
@@ -760,11 +802,236 @@ public class MainActivity extends Activity {
                     toast("地址无效: 需要 IPv4 / [IPv6] / 域名 + 可选端口");
                     return;
                 }
+                String oldUrl = serverUrl;
                 serverUrl = normalized;
                 prefs.edit().putString(PREF_URL, serverUrl).apply();
+                renameBookUrl(oldUrl, normalized);
                 AppLog.i("Config", "地址变更 → " + serverUrl);
                 firstLoadDone = false;
                 loadPiWeb("config");
+            })
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    // ---------------------------------------------------------------- 地址簿 (v2.5)
+
+    /** 地址簿条目: 名称 + 完整 URL(可含 ?ccr_web_token= 等查询参数)。 */
+    private static final class BookEntry {
+        final String name;
+        final String url;
+        BookEntry(String name, String url) {
+            this.name = name;
+            this.url = url;
+        }
+    }
+
+    private List<BookEntry> loadBook() {
+        List<BookEntry> list = new ArrayList<>();
+        String json = prefs.getString(PREF_BOOK, "");
+        if (json.isEmpty()) return list;
+        try {
+            JSONArray arr = new JSONArray(json);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                String name = o.optString("name", "").trim();
+                String url = o.optString("url", "").trim();
+                if (!name.isEmpty() && !url.isEmpty()) {
+                    list.add(new BookEntry(name, url));
+                }
+            }
+        } catch (Exception e) {
+            AppLog.w("Book", "地址簿解析失败,按空处理: " + e);
+        }
+        return list;
+    }
+
+    private void saveBook(List<BookEntry> list) {
+        JSONArray arr = new JSONArray();
+        try {
+            for (BookEntry e : list) {
+                JSONObject o = new JSONObject();
+                o.put("name", e.name);
+                o.put("url", e.url);
+                arr.put(o);
+            }
+        } catch (Exception ignored) {
+        }
+        prefs.edit().putString(PREF_BOOK, arr.toString()).apply();
+    }
+
+    /** v2.5 首次启动迁移: 把已有地址存为地址簿首条 "Pi Web"。 */
+    private void migrateBook() {
+        if (!prefs.getString(PREF_BOOK, "").isEmpty()) return;
+        List<BookEntry> list = new ArrayList<>();
+        list.add(new BookEntry("Pi Web", serverUrl));
+        saveBook(list);
+        AppLog.i("Book", "迁移完成: 当前地址已存为地址簿首条 Pi Web");
+    }
+
+    private int bookIndexOf(List<BookEntry> list, String url) {
+        for (int i = 0; i < list.size(); i++) {
+            if (list.get(i).url.equals(url)) return i;
+        }
+        return -1;
+    }
+
+    /** 错误页「修改地址」改址后同步地址簿: 命中旧地址的条目跟随更新。 */
+    private void renameBookUrl(String oldUrl, String newUrl) {
+        List<BookEntry> list = loadBook();
+        int idx = bookIndexOf(list, oldUrl);
+        if (idx < 0) return;
+        BookEntry old = list.get(idx);
+        list.set(idx, new BookEntry(old.name, newUrl));
+        saveBook(list);
+        AppLog.i("Book", "条目跟随更新: " + old.name + " → " + newUrl);
+    }
+
+    /** 快切/连接到某条目(π 菜单与地址簿共用)。 */
+    private void switchTo(BookEntry entry, String trigger) {
+        if (entry.url.equals(serverUrl)) {
+            toast("当前已是 " + entry.name + ",刷新页面");
+            loadPiWeb("manual");
+            return;
+        }
+        AppLog.i("Book", "切换服务: " + entry.name + " → " + entry.url
+            + " (trigger=" + trigger + ")");
+        serverUrl = entry.url;
+        prefs.edit().putString(PREF_URL, serverUrl).apply();
+        firstLoadDone = false;
+        loadPiWeb("switch");
+        toast("已切换到 " + entry.name);
+    }
+
+    /**
+     * π 菜单 → 服务器地址簿。
+     * 点按条目 = 连接;长按条目 = 编辑/删除;底部按钮 = 添加新条目。
+     */
+    private void openBookDialog() {
+        final List<BookEntry> book = loadBook();
+        AppLog.i("Book", "打开地址簿: " + book.size() + " 条");
+
+        ListView listView = new ListView(this);
+        String[] names = new String[book.size()];
+        for (int i = 0; i < book.size(); i++) names[i] = book.get(i).name;
+        ArrayAdapter<String> adapter = new ArrayAdapter<String>(this,
+            android.R.layout.simple_list_item_2, android.R.id.text1, names) {
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                View v = super.getView(position, convertView, parent);
+                TextView t1 = (TextView) v.findViewById(android.R.id.text1);
+                TextView t2 = (TextView) v.findViewById(android.R.id.text2);
+                BookEntry e = book.get(position);
+                t1.setText(e.name + (e.url.equals(serverUrl) ? " ✓" : ""));
+                t1.setTextColor(C_TEXT);
+                t2.setText(e.url);
+                t2.setTextColor(C_MUTED);
+                return v;
+            }
+        };
+        listView.setAdapter(adapter);
+
+        final AlertDialog dialog = new AlertDialog.Builder(this)
+            .setTitle("服务器地址簿")
+            .setView(listView)
+            .setPositiveButton("＋ 添加新地址", (d, w) -> openEntryDialog(null, -1))
+            .setNegativeButton("关闭", null)
+            .create();
+
+        listView.setOnItemClickListener((parent, view, position, id) -> {
+            dialog.dismiss();
+            switchTo(book.get(position), "book");
+        });
+        listView.setOnItemLongClickListener((parent, view, position, id) -> {
+            openEntryDialog(book.get(position), position);
+            return true;
+        });
+        dialog.show();
+    }
+
+    /**
+     * 添加(index<0)/编辑(index≥0)地址簿条目。
+     * 地址走 normalizeUrl 校验(IPv4 / [IPv6] / 域名,可含查询参数),可省略 http://。
+     */
+    private void openEntryDialog(final BookEntry existing, final int index) {
+        final EditText nameInput = new EditText(this);
+        nameInput.setHint("名称,如: Pi Web / CCR 控制台");
+        nameInput.setSingleLine(true);
+        final EditText urlInput = new EditText(this);
+        urlInput.setHint("地址,如: http://100.117.232.62:30141");
+        urlInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        urlInput.setSingleLine(true);
+        if (existing != null) {
+            nameInput.setText(existing.name);
+            urlInput.setText(existing.url);
+        }
+
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(dp(20), dp(10), dp(20), 0);
+        layout.addView(nameInput, new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams urlLp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        urlLp.topMargin = dp(8);
+        layout.addView(urlInput, urlLp);
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+            .setTitle(existing == null ? "添加地址" : "编辑地址")
+            .setView(layout)
+            .setNegativeButton("取消", null);
+
+        if (existing != null) {
+            builder.setNeutralButton("删除", (d, w) -> confirmDelete(existing));
+        }
+        builder.setPositiveButton(existing == null ? "添加" : "保存", (d, w) -> {
+            String name = nameInput.getText().toString().trim();
+            String url = normalizeUrl(urlInput.getText().toString());
+            if (name.isEmpty()) {
+                toast("名称不能为空");
+                openEntryDialog(existing, index);
+                return;
+            }
+            if (url == null) {
+                toast("地址无效: 需要 IPv4 / [IPv6] / 域名 + 可选端口");
+                openEntryDialog(existing, index);
+                return;
+            }
+            List<BookEntry> book = loadBook();
+            if (index >= 0 && index < book.size()) {
+                book.set(index, new BookEntry(name, url));
+                AppLog.i("Book", "编辑条目: " + name + " → " + url);
+                toast("已保存");
+            } else {
+                book.add(new BookEntry(name, url));
+                AppLog.i("Book", "添加条目: " + name + " → " + url);
+                toast("已添加");
+            }
+            saveBook(book);
+            // 编辑的若是当前连接条目,跟随切换地址
+            if (existing != null && existing.url.equals(serverUrl) && !url.equals(serverUrl)) {
+                serverUrl = url;
+                prefs.edit().putString(PREF_URL, serverUrl).apply();
+                firstLoadDone = false;
+                loadPiWeb("config");
+            }
+        });
+        builder.show();
+    }
+
+    private void confirmDelete(final BookEntry entry) {
+        new AlertDialog.Builder(this)
+            .setTitle("删除条目")
+            .setMessage("确认删除 \"" + entry.name + "\"?\n" + entry.url)
+            .setPositiveButton("删除", (d, w) -> {
+                List<BookEntry> book = loadBook();
+                int idx = bookIndexOf(book, entry.url);
+                if (idx >= 0) {
+                    book.remove(idx);
+                    saveBook(book);
+                }
+                AppLog.i("Book", "删除条目: " + entry.name);
+                toast("已删除 " + entry.name);
             })
             .setNegativeButton("取消", null)
             .show();

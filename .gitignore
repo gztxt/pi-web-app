@@ -11,3 +11,7 @@
 local.properties
 /app/build
 /app/release
+/releases
+
+# 本地备份(铁律: 先备份后修改)
+*.bak-*

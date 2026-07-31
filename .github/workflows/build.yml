@@ -23,7 +23,28 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Build Debug APK (Gradle Wrapper 8.5 + AGP 8.2.2)
+      - name: Cache signing keystore
+        uses: actions/cache@v4
+        with:
+          path: signing
+          key: piweb-signing-keystore-v1
+
+      - name: Generate stable keystore if missing
+        run: |
+          if [ ! -f signing/piweb.jks ]; then
+            mkdir -p signing
+            keytool -genkeypair -v -keystore signing/piweb.jks -alias piweb \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass piweb2026 -keypass piweb2026 \
+              -dname "CN=PiWeb, OU=Personal, O=gztxt, C=CN"
+          fi
+
+      - name: Build Debug APK (stable signing)
+        env:
+          PIWEB_KEYSTORE: ${{ github.workspace }}/signing/piweb.jks
+          PIWEB_STORE_PASSWORD: piweb2026
+          PIWEB_KEY_ALIAS: piweb
+          PIWEB_KEY_PASSWORD: piweb2026
         run: ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: List APK

@@ -76,14 +76,14 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_URL = "http://100.117.232.62:30141";
-    private static final String APP_VERSION = "2.7";
+    private static final String APP_VERSION = "2.8";
     private static final String PREFS = "piweb_prefs";
     private static final String PREF_URL = "server_url";
     private static final String PREF_BOOK = "server_book";
     private static final String PREF_DESKTOP = "desktop_mode";
     private static final String PREF_HINT = "hint_shown";
     private static final String PREF_SYNC = "sync_url";
-    private static final String DEFAULT_SYNC = "http://192.168.5.102:5001";
+    private static final String DEFAULT_SYNC = "http://192.168.5.102:5002";
     private static final String ERROR_BASE = "https://piweb.error/";
     private static final int REQ_FILE_CHOOSER = 1001;
     private static final int AUTO_RETRY_SECONDS = 8;

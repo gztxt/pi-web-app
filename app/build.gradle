@@ -10,8 +10,21 @@ android {
         applicationId "com.gztxt.piweb"
         minSdk 24
         targetSdk 34
-        versionCode 8
-        versionName "2.7"
+        versionCode 9
+        versionName "2.8"
+    }
+
+    def ksPath = System.getenv("PIWEB_KEYSTORE")
+    def hasStableKey = ksPath != null && file(ksPath).exists()
+    if (hasStableKey) {
+        signingConfigs {
+            stable {
+                storeFile file(ksPath)
+                storePassword System.getenv("PIWEB_STORE_PASSWORD")
+                keyAlias System.getenv("PIWEB_KEY_ALIAS")
+                keyPassword System.getenv("PIWEB_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
@@ -20,6 +33,7 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
         debug {
+            if (hasStableKey) signingConfig signingConfigs.stable
             debuggable true
         }
     }

@@ -25,6 +25,9 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.webkit.CookieManager;
+import android.webkit.DownloadListener;
+import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
@@ -34,6 +37,12 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.ArrayAdapter;
+
+import android.app.DownloadManager;
+import android.content.pm.PackageManager;
+import android.os.Environment;
+import android.os.Message;
+import android.Manifest;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -67,7 +76,7 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_URL = "http://100.117.232.62:30141";
-    private static final String APP_VERSION = "2.5";
+    private static final String APP_VERSION = "2.6";
     private static final String PREFS = "piweb_prefs";
     private static final String PREF_URL = "server_url";
     private static final String PREF_BOOK = "server_book";
@@ -110,6 +119,10 @@ public class MainActivity extends Activity {
     private boolean diagPending = false;   // 错误页渲染完成后自动诊断
     private boolean diagRunning = false;   // 防止并发诊断
     private TextView diagDialogText;       // 菜单诊断对话框实时输出
+
+    // v2.6 下载功能
+    private static final int REQ_STORAGE = 1002;
+    private String pendingDownloadUrl, pendingDownloadName, pendingDownloadMime;
 
     private final Runnable countdownTick = new Runnable() {
         @Override
@@ -353,8 +366,31 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             s.setSafeBrowsingEnabled(false); // 内网/Tailscale 私有地址,避免误拦截
         }
+        // v2.6 支持 target=_blank 新窗口
+        s.setSupportMultipleWindows(true);
+        s.setJavaScriptCanOpenWindowsAutomatically(true);
         defaultUserAgent = s.getUserAgentString();
         applyUserAgent();
+
+        // v2.6 下载监听器
+        webView.setDownloadListener(new DownloadListener() {
+            @Override
+            public void onDownloadStart(String url, String userAgent, String contentDisposition,
+                                        String mimetype, long contentLength) {
+                AppLog.i("Download", "开始 url=" + url + " mime=" + mimetype);
+                final String fileName = URLUtil.guessFileName(url, contentDisposition, mimetype);
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+                        && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                           != PackageManager.PERMISSION_GRANTED) {
+                    pendingDownloadUrl = url;
+                    pendingDownloadName = fileName;
+                    pendingDownloadMime = mimetype;
+                    requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_STORAGE);
+                    return;
+                }
+                enqueueDownload(url, fileName, mimetype);
+            }
+        });
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
@@ -471,20 +507,37 @@ public class MainActivity extends Activity {
                 }
                 return true;
             }
+
+            // v2.6 支持 target="_blank" / window.open 新窗口
+            @Override
+            public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
+                final WebView child = new WebView(view.getContext());
+                child.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest request) {
+                        String target = request.getUrl().toString();
+                        AppLog.i("Window", "target=_blank → 主视图加载: " + target);
+                        webView.loadUrl(target);
+                        return true;
+                    }
+                });
+                WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
+                transport.setWebView(child);
+                resultMsg.sendToTarget();
+                return true;
+            }
         });
     }
 
     private void applyUserAgent() {
         WebSettings s = webView.getSettings();
+        String ua = defaultUserAgent;
         if (desktopMode) {
-            String ua = defaultUserAgent
-                .replace(" Mobile", "")
+            ua = ua.replace(" Mobile", "")
                 .replace(" wv) ", ") ")
                 .replace("Android ", "");
-            s.setUserAgentString(ua);
-        } else {
-            s.setUserAgentString(defaultUserAgent);
         }
+        s.setUserAgentString(ua + " PiWeb/" + APP_VERSION);
         s.setLoadWithOverviewMode(desktopMode);
         s.setUseWideViewPort(true);
     }
@@ -1101,6 +1154,44 @@ public class MainActivity extends Activity {
 
     private void toast(String msg) {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_STORAGE) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                if (pendingDownloadUrl != null) {
+                    enqueueDownload(pendingDownloadUrl, pendingDownloadName, pendingDownloadMime);
+                    pendingDownloadUrl = null;
+                }
+            } else {
+                toast("未授予存储权限,无法下载");
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- 下载功能
+
+    private void enqueueDownload(String url, String fileName, String mimetype) {
+        try {
+            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+            if (mimetype != null) req.setMimeType(mimetype);
+            String cookies = CookieManager.getInstance().getCookie(url);
+            if (cookies != null) req.addRequestHeader("Cookie", cookies);
+            req.addRequestHeader("User-Agent", webView.getSettings().getUserAgentString());
+            req.setTitle(fileName);
+            req.setDescription("Pi Web 下载");
+            req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName);
+            DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+            long id = dm.enqueue(req);
+            AppLog.i("Download", "已加入下载队列 id=" + id + " file=" + fileName);
+            toast("开始下载: " + fileName);
+        } catch (Exception e) {
+            AppLog.e("Download", "下载失败: " + e);
+            toast("下载失败: " + e.getMessage());
+        }
     }
 
     // -------------------------------------------------------------- 生命周期

@@ -76,12 +76,14 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_URL = "http://100.117.232.62:30141";
-    private static final String APP_VERSION = "2.6";
+    private static final String APP_VERSION = "2.7";
     private static final String PREFS = "piweb_prefs";
     private static final String PREF_URL = "server_url";
     private static final String PREF_BOOK = "server_book";
     private static final String PREF_DESKTOP = "desktop_mode";
     private static final String PREF_HINT = "hint_shown";
+    private static final String PREF_SYNC = "sync_url";
+    private static final String DEFAULT_SYNC = "http://192.168.5.102:5001";
     private static final String ERROR_BASE = "https://piweb.error/";
     private static final int REQ_FILE_CHOOSER = 1001;
     private static final int AUTO_RETRY_SECONDS = 8;
@@ -163,6 +165,7 @@ public class MainActivity extends Activity {
         serverUrl = prefs.getString(PREF_URL, DEFAULT_URL);
         desktopMode = prefs.getBoolean(PREF_DESKTOP, false);
         migrateBook();
+        Sync.setSyncUrl(prefs.getString(PREF_SYNC, DEFAULT_SYNC));
 
         AppLog.init(getApplicationContext());
         AppLog.installCrashHandler();
@@ -621,69 +624,159 @@ public class MainActivity extends Activity {
     // ---------------------------------------------------------------- 菜单
 
     /**
-     * π 菜单(v2.5): 顶部为地址簿快切列表(当前服务 ✓ 标记),
-     * 其下为地址簿管理与常规功能项。
+     * π 菜单(v2.7): 手风琴风格分组菜单，可滚动，后期加菜单不担心高度。
+     * 分组：顶层直达动作 + 📱 应用(默认展开，含地址簿快切) + ⚙️ 设置(默认折叠)。
      */
     private void openMenu() {
         final List<BookEntry> book = loadBook();
-        final List<String> items = new ArrayList<>();
-        for (BookEntry e : book) {
-            items.add((e.url.equals(serverUrl) ? "✓ " : "     ") + e.name);
-        }
-        items.add("────────────");
-        final int bookManageIndex = items.size();
-        items.add("服务器地址簿…");
-        items.add("刷新页面");
-        items.add("运行日志");
-        items.add("网络诊断");
-        items.add(desktopMode ? "桌面模式: 开 → 关" : "桌面模式: 关 → 开");
-        items.add("在浏览器打开");
-        items.add("关于");
+        final AlertDialog[] dlg = new AlertDialog[1];
 
-        new AlertDialog.Builder(this)
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(6), dp(10), dp(6), dp(10));
+        scroll.addView(root, new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT));
+
+        // 顶层直达动作
+        root.addView(menuRow("🔄 刷新页面", () -> loadPiWeb("manual"), dlg));
+
+        // 手风琴：应用（默认展开）
+        LinearLayout appBody = new LinearLayout(this);
+        appBody.setOrientation(LinearLayout.VERTICAL);
+        for (BookEntry e : book) {
+            final BookEntry ee = e;
+            appBody.addView(menuRow((e.url.equals(serverUrl) ? "✓ " : "      ") + e.name,
+                () -> switchTo(ee, "menu"), dlg));
+        }
+        appBody.addView(menuRow("＋ 管理地址簿…", this::openBookDialog, dlg));
+        root.addView(menuHeader("📱 应用", appBody, true));
+        root.addView(appBody);
+
+        // 手风琴：设置（默认折叠）
+        LinearLayout setBody = new LinearLayout(this);
+        setBody.setOrientation(LinearLayout.VERTICAL);
+        setBody.addView(menuRow("运行日志", this::openLogDialog, dlg));
+        setBody.addView(menuRow("网络诊断", this::openDiagDialog, dlg));
+        setBody.addView(menuRow(desktopMode ? "桌面模式: 开 → 关" : "桌面模式: 关 → 开", () -> {
+            desktopMode = !desktopMode;
+            prefs.edit().putBoolean(PREF_DESKTOP, desktopMode).apply();
+            applyUserAgent();
+            AppLog.i("Mode", "桌面模式: " + (desktopMode ? "开" : "关"));
+            loadPiWeb("mode");
+            toast(desktopMode ? "已切换到桌面版页面" : "已切换到移动版页面");
+        }, dlg));
+        setBody.addView(menuRow("在浏览器打开", () -> {
+            try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(serverUrl))); }
+            catch (Exception e) { toast("没有可用的浏览器"); }
+        }, dlg));
+        setBody.addView(menuRow("同步设置…", this::openSyncDialog, dlg));
+        setBody.addView(menuRow("从服务器恢复地址簿", this::restoreBook, dlg));
+        setBody.addView(menuRow("关于", this::showAbout, dlg));
+        root.addView(menuHeader("⚙️ 设置", setBody, false));
+        root.addView(setBody);
+
+        dlg[0] = new AlertDialog.Builder(this)
             .setTitle("Pi Web · " + currentServiceName(book))
-            .setItems(items.toArray(new String[0]), (dialog, which) -> {
-                if (which < book.size()) {
-                    switchTo(book.get(which), "menu");
-                    return;
-                }
-                if (which == bookManageIndex) {
-                    openBookDialog();
-                    return;
-                }
-                switch (which - bookManageIndex) {
-                    case 1: // 刷新页面
-                        loadPiWeb("manual");
-                        break;
-                    case 2:
-                        openLogDialog();
-                        break;
-                    case 3:
-                        openDiagDialog();
-                        break;
-                    case 4:
-                        desktopMode = !desktopMode;
-                        prefs.edit().putBoolean(PREF_DESKTOP, desktopMode).apply();
-                        applyUserAgent();
-                        AppLog.i("Mode", "桌面模式: " + (desktopMode ? "开" : "关"));
-                        loadPiWeb("mode");
-                        toast(desktopMode ? "已切换到桌面版页面" : "已切换到移动版页面");
-                        break;
-                    case 5:
-                        try {
-                            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(serverUrl)));
-                        } catch (Exception e) {
-                            toast("没有可用的浏览器");
-                        }
-                        break;
-                    case 6:
-                        showAbout();
-                        break;
-                    default:
-                        break; // 分隔线,忽略
-                }
+            .setView(scroll)
+            .setNegativeButton("关闭", null)
+            .create();
+        dlg[0].show();
+    }
+
+    /** 手风琴普通行：点击执行动作并关闭菜单。 */
+    private TextView menuRow(String text, Runnable action, final AlertDialog[] dlg) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextColor(C_TEXT);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        t.setGravity(Gravity.CENTER_VERTICAL);
+        t.setPadding(dp(22), dp(13), dp(22), dp(13));
+        t.setClickable(true);
+        t.setFocusable(true);
+        TypedValue out = new TypedValue();
+        getTheme().resolveAttribute(android.R.attr.selectableItemBackground, out, true);
+        t.setBackgroundResource(out.resourceId);
+        t.setOnClickListener(v -> {
+            if (dlg[0] != null) dlg[0].dismiss();
+            if (action != null) action.run();
+        });
+        return t;
+    }
+
+    /** 手风琴分组头：点击展开/折叠 body。 */
+    private TextView menuHeader(String title, final LinearLayout body, boolean startExpanded) {
+        final TextView h = new TextView(this);
+        h.setTextColor(C_ACCENT);
+        h.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        h.setTypeface(Typeface.DEFAULT_BOLD);
+        h.setGravity(Gravity.CENTER_VERTICAL);
+        h.setPadding(dp(16), dp(12), dp(16), dp(12));
+        h.setBackgroundColor(C_PANEL);
+        final boolean[] exp = {startExpanded};
+        body.setVisibility(startExpanded ? View.VISIBLE : View.GONE);
+        h.setText((startExpanded ? "▼ " : "▶ ") + title);
+        h.setOnClickListener(v -> {
+            exp[0] = !exp[0];
+            body.setVisibility(exp[0] ? View.VISIBLE : View.GONE);
+            h.setText((exp[0] ? "▼ " : "▶ ") + title);
+        });
+        return h;
+    }
+
+    /** 同步服务器地址设置（留空=关闭）。 */
+    private void openSyncDialog() {
+        EditText input = new EditText(this);
+        input.setText(prefs.getString(PREF_SYNC, DEFAULT_SYNC));
+        input.setHint("http://192.168.5.102:5001（留空关闭）");
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        input.setSingleLine(true);
+        FrameLayout c = new FrameLayout(this);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = dp(20); lp.rightMargin = dp(20); lp.topMargin = dp(8);
+        c.addView(input, lp);
+        new AlertDialog.Builder(this)
+            .setTitle("同步服务器")
+            .setMessage("地址簿与运行日志自动备份到此服务器（需运行含 /api/kv、/api/app-log 的服务，如安防维保系统）。留空=关闭同步。")
+            .setView(c)
+            .setPositiveButton("保存", (d, w) -> {
+                String url = input.getText().toString().trim();
+                prefs.edit().putString(PREF_SYNC, url).apply();
+                Sync.setSyncUrl(url);
+                AppLog.i("Sync", "同步服务器: " + (url.isEmpty() ? "(关闭)" : url));
+                toast(url.isEmpty() ? "已关闭同步" : "同步服务器已设置");
             })
+            .setNegativeButton("取消", null)
             .show();
+    }
+
+    /** 从服务器恢复地址簿。 */
+    private void restoreBook() {
+        if (!Sync.enabled()) { toast("请先在 同步设置 填写同步服务器"); return; }
+        toast("正在从服务器恢复…");
+        Sync.pullBook((ok, body) -> runOnUiThread(() -> {
+            if (!ok || body == null) { toast("恢复失败：服务器不可达或无备份"); return; }
+            try {
+                JSONObject resp = new JSONObject(body);
+                JSONObject data = resp.optJSONObject("data");
+                JSONArray arr = data == null ? null : data.optJSONArray("book");
+                if (arr == null || arr.length() == 0) { toast("服务器上没有地址簿备份"); return; }
+                List<BookEntry> list = new ArrayList<>();
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject o = arr.getJSONObject(i);
+                    String name = o.optString("name", "").trim();
+                    String url = o.optString("url", "").trim();
+                    if (!name.isEmpty() && !url.isEmpty()) list.add(new BookEntry(name, url));
+                }
+                if (list.isEmpty()) { toast("备份为空"); return; }
+                saveBook(list);
+                AppLog.i("Sync", "从服务器恢复地址簿: " + list.size() + " 条");
+                toast("已恢复 " + list.size() + " 个地址");
+            } catch (Exception e) {
+                toast("恢复失败: " + e.getMessage());
+            }
+        }));
     }
 
     private String currentServiceName(List<BookEntry> book) {
@@ -911,6 +1004,7 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {
         }
         prefs.edit().putString(PREF_BOOK, arr.toString()).apply();
+        Sync.pushBook(arr.toString());
     }
 
     /** v2.5 首次启动迁移: 把已有地址存为地址簿首条 "Pi Web"。 */
@@ -1229,6 +1323,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        Sync.flushLogs();
         if (webView != null) webView.onPause();
         super.onPause();
     }

@@ -62,6 +62,7 @@ public final class AppLog {
         int prio = "E".equals(level) ? Log.ERROR : ("W".equals(level) ? Log.WARN : Log.INFO);
         Log.println(prio, TAG, tag + ": " + msg);
         appendToFile(line);
+        Sync.queueLog(line);
     }
 
     private static void appendToFile(String line) {

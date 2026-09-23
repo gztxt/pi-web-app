@@ -83,7 +83,10 @@ public class MainActivity extends Activity {
     private static final String PREF_DESKTOP = "desktop_mode";
     private static final String PREF_HINT = "hint_shown";
     private static final String PREF_SYNC = "sync_url";
+    /** 最后一层兜底：局域网固定地址。手机离开局域网即不可达，故只作候选清单末位。 */
     private static final String DEFAULT_SYNC = "http://192.168.5.102:5002";
+    private static final int SYNC_PORT = 5002;            // piweb-sync 监听端口
+    private static final int SYNC_MAX_CANDIDATES = 3;     // 回传候选预算（硬上限）
     private static final String ERROR_BASE = "https://piweb.error/";
     private static final int REQ_FILE_CHOOSER = 1001;
     private static final int AUTO_RETRY_SECONDS = 8;
@@ -109,6 +112,10 @@ public class MainActivity extends Activity {
     private String serverUrl = DEFAULT_URL;
     private boolean desktopMode = false;
     private String defaultUserAgent;
+
+    // v2.8.1 日志回传状态
+    private boolean syncLogGuard = false;   // AppLog↔Sync 递归保护
+    private boolean syncLastOk = true;      // 上一次回传结果（只在状态跃变时 toast）
 
     private boolean firstLoadDone = false;   // 首次成功加载后不再显示 Splash
     private boolean inError = false;         // 当前处于错误页
@@ -164,11 +171,13 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         serverUrl = prefs.getString(PREF_URL, DEFAULT_URL);
         desktopMode = prefs.getBoolean(PREF_DESKTOP, false);
-        migrateBook();
-        Sync.setSyncUrl(prefs.getString(PREF_SYNC, DEFAULT_SYNC));
 
         AppLog.init(getApplicationContext());
         AppLog.installCrashHandler();
+        Sync.setStatusListener(this::onSyncStatus);
+        // 先定候选再 migrateBook：首启迁移的地址簿备份才有地方可发
+        applySyncTargets("启动");
+        migrateBook();
         AppLog.i("App", "==== 启动 v" + APP_VERSION + " | Android " + Build.VERSION.RELEASE
             + " (API " + Build.VERSION.SDK_INT + ") | " + Build.MANUFACTURER + " " + Build.MODEL + " ====");
         AppLog.i("App", "地址: " + serverUrl + " | 桌面模式: " + desktopMode);
@@ -724,11 +733,131 @@ public class MainActivity extends Activity {
         return h;
     }
 
-    /** 同步服务器地址设置（留空=关闭）。 */
+    // ------------------------------------------------ 日志回传目标 (v2.8.1)
+
+    /**
+     * 重算并注入回传候选清单，同时写一条日志。
+     * 调用点：启动 / 改址 / 快切 / 编辑当前条目 / 从服务器恢复地址簿 / 同步设置变更。
+     */
+    private void applySyncTargets(String trigger) {
+        List<String> cands = syncCandidates();
+        Sync.setSyncCandidates(cands);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < cands.size(); i++) {
+            if (i > 0) sb.append(" → ");
+            sb.append('[').append(i + 1).append(']').append(cands.get(i));
+        }
+        AppLog.i("Sync", "回传目标(" + trigger + "): "
+            + (cands.isEmpty() ? "已关闭（无候选地址）" : sb.toString()));
+    }
+
+    /**
+     * 有序候选清单（最多 3 个，Sync 侧每个只试 1 次、单次超时 ≤5s、失败不轮询）：
+     *  1. 当前服务器派生 —— scheme://同主机:5002（在 Tailscale/外网时同样命中）
+     *  2. 地址簿内另一主机派生（优先 Tailscale 100.64.0.0/10）
+     *  3. DEFAULT_SYNC 兜底常量
+     * 向后兼容：用户在「同步设置」里显式填过值 → 用户值仍为首选（另补一条派生项防静默失联）；
+     *          显式留空 → 关闭同步（保持 v2.7「留空=关闭」语义）。
+     */
+    private List<String> syncCandidates() {
+        List<String> out = new ArrayList<>();
+        String manual = prefs.getString(PREF_SYNC, null);
+        if (manual != null) {
+            String m = manual.trim();
+            if (m.isEmpty()) return out;
+            addCandidate(out, m);
+            addCandidate(out, deriveSyncUrl(serverUrl));
+            return out;
+        }
+        addCandidate(out, deriveSyncUrl(serverUrl));
+        addCandidate(out, syncFromOtherBookEntry());
+        addCandidate(out, DEFAULT_SYNC);
+        return out;
+    }
+
+    private void addCandidate(List<String> list, String url) {
+        if (url == null) return;
+        String s = url.trim();
+        if (s.isEmpty() || list.contains(s)) return;
+        if (list.size() >= SYNC_MAX_CANDIDATES) return;
+        list.add(s);
+    }
+
+    /** 由服务器地址派生回传地址：同协议、同主机、端口换成 SYNC_PORT；无法解析返回 null。 */
+    static String deriveSyncUrl(String server) {
+        String norm = normalizeUrl(server);
+        if (norm == null) return null;
+        Uri uri = Uri.parse(norm);
+        String host = uri.getHost();
+        if (host == null || host.isEmpty()) return null;
+        String scheme = uri.getScheme() == null ? "http" : uri.getScheme();
+        if (host.indexOf(':') >= 0 && !host.startsWith("[")) host = "[" + host + "]";
+        return scheme + "://" + host + ":" + SYNC_PORT;
+    }
+
+    /** 地址簿中第一个「与当前服务器不同主机」的条目（Tailscale 优先）派生出的回传地址。 */
+    private String syncFromOtherBookEntry() {
+        String cur = hostOf(serverUrl);
+        String fallback = null;
+        for (BookEntry e : loadBook()) {
+            String h = hostOf(e.url);
+            if (h == null || h.equals(cur)) continue;
+            if (isTailscale(h)) return deriveSyncUrl(e.url);
+            if (fallback == null) fallback = e.url;
+        }
+        return deriveSyncUrl(fallback);
+    }
+
+    private static String hostOf(String url) {
+        String norm = normalizeUrl(url);
+        if (norm == null) return null;
+        String h = Uri.parse(norm).getHost();
+        return (h == null || h.isEmpty()) ? null : h;
+    }
+
+    /** Tailscale CGNAT 网段 100.64.0.0/10 的粗判。 */
+    private static boolean isTailscale(String host) {
+        return host != null && host.startsWith("100.");
+    }
+
+    /** Sync 状态回调（后台线程发起）→ 主线程写运行日志/诊断框/toast。 */
+    private void onSyncStatus(String line, boolean ok) {
+        runOnUiThread(() -> {
+            if (syncLogGuard) return;
+            syncLogGuard = true;
+            try {
+                if (ok) AppLog.i("Sync", line);
+                else AppLog.w("Sync", line);
+            } finally {
+                syncLogGuard = false;
+            }
+            if (diagDialogText != null) diagDialogText.append(line).append("\n");
+            if (ok != syncLastOk) {
+                syncLastOk = ok;
+                toast(ok ? "日志回传已恢复" : "日志回传失败（π菜单→运行日志 查看）");
+            }
+        });
+    }
+
+    /** 候选清单的一行摘要（关于对话框 / 同步设置对话框展示用）。 */
+    private String syncTargetsBrief() {
+        List<String> c = Sync.candidates();
+        if (c.isEmpty()) return "已关闭";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < c.size(); i++) {
+            if (i > 0) sb.append("\n");
+            sb.append(i + 1).append(") ").append(c.get(i));
+        }
+        return sb.toString();
+    }
+
+    /** 同步服务器地址设置：自动跟随当前服务器 / 手动指定 / 留空关闭。 */
     private void openSyncDialog() {
+        String manual = prefs.getString(PREF_SYNC, null);
+        boolean auto = (manual == null);
         EditText input = new EditText(this);
-        input.setText(prefs.getString(PREF_SYNC, DEFAULT_SYNC));
-        input.setHint("http://192.168.5.102:5001（留空关闭）");
+        if (!auto) input.setText(manual);
+        input.setHint("http://192.168.5.102:5002（留空=关闭同步）");
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         input.setSingleLine(true);
         FrameLayout c = new FrameLayout(this);
@@ -738,14 +867,22 @@ public class MainActivity extends Activity {
         c.addView(input, lp);
         new AlertDialog.Builder(this)
             .setTitle("同步服务器")
-            .setMessage("地址簿与运行日志自动备份到此服务器（需运行含 /api/kv、/api/app-log 的服务，如安防维保系统）。留空=关闭同步。")
+            .setMessage("地址簿与运行日志回传到此服务器的 piweb-sync（端口 " + SYNC_PORT + "）。\n"
+                + "当前模式: " + (auto ? "自动（跟随当前服务器，候选见下）" : "手动") + "\n"
+                + "候选清单:\n" + syncTargetsBrief() + "\n"
+                + "最近状态: " + Sync.status() + "\n\n"
+                + "手动填写后优先用该地址（仍会补一条当前服务器派生项）；留空=关闭同步；「改为自动」恢复跟随当前服务器。")
             .setView(c)
             .setPositiveButton("保存", (d, w) -> {
                 String url = input.getText().toString().trim();
                 prefs.edit().putString(PREF_SYNC, url).apply();
-                Sync.setSyncUrl(url);
-                AppLog.i("Sync", "同步服务器: " + (url.isEmpty() ? "(关闭)" : url));
-                toast(url.isEmpty() ? "已关闭同步" : "同步服务器已设置");
+                applySyncTargets("手动设置");
+                toast(url.isEmpty() ? "已关闭同步" : "同步服务器已设为 " + url);
+            })
+            .setNeutralButton("改为自动", (d, w) -> {
+                prefs.edit().remove(PREF_SYNC).apply();
+                applySyncTargets("自动");
+                toast("已改为自动跟随当前服务器");
             })
             .setNegativeButton("取消", null)
             .show();
@@ -753,7 +890,7 @@ public class MainActivity extends Activity {
 
     /** 从服务器恢复地址簿。 */
     private void restoreBook() {
-        if (!Sync.enabled()) { toast("请先在 同步设置 填写同步服务器"); return; }
+        if (!Sync.enabled()) { toast("同步已关闭：π菜单→同步设置→改为自动"); return; }
         toast("正在从服务器恢复…");
         Sync.pullBook((ok, body) -> runOnUiThread(() -> {
             if (!ok || body == null) { toast("恢复失败：服务器不可达或无备份"); return; }
@@ -772,6 +909,7 @@ public class MainActivity extends Activity {
                 if (list.isEmpty()) { toast("备份为空"); return; }
                 saveBook(list);
                 AppLog.i("Sync", "从服务器恢复地址簿: " + list.size() + " 条");
+                applySyncTargets("恢复地址簿");
                 toast("已恢复 " + list.size() + " 个地址");
             } catch (Exception e) {
                 toast("恢复失败: " + e.getMessage());
@@ -839,6 +977,7 @@ public class MainActivity extends Activity {
         }
         diagRunning = true;
         AppLog.i("Diag", "==== 开始诊断 " + serverUrl + " ====");
+        onDiagLine("日志回传: " + Sync.status() + "（不额外发探测包）");
         if (inError) {
             webView.evaluateJavascript(
                 "(function(){var e=document.getElementById('diag');if(e)e.textContent='';})();",
@@ -953,6 +1092,7 @@ public class MainActivity extends Activity {
                 prefs.edit().putString(PREF_URL, serverUrl).apply();
                 renameBookUrl(oldUrl, normalized);
                 AppLog.i("Config", "地址变更 → " + serverUrl);
+                applySyncTargets("改址");
                 firstLoadDone = false;
                 loadPiWeb("config");
             })
@@ -1045,6 +1185,7 @@ public class MainActivity extends Activity {
             + " (trigger=" + trigger + ")");
         serverUrl = entry.url;
         prefs.edit().putString(PREF_URL, serverUrl).apply();
+        applySyncTargets("切换");
         firstLoadDone = false;
         loadPiWeb("switch");
         toast("已切换到 " + entry.name);
@@ -1159,6 +1300,7 @@ public class MainActivity extends Activity {
             if (existing != null && existing.url.equals(serverUrl) && !url.equals(serverUrl)) {
                 serverUrl = url;
                 prefs.edit().putString(PREF_URL, serverUrl).apply();
+                applySyncTargets("编辑条目");
                 firstLoadDone = false;
                 loadPiWeb("config");
             }
@@ -1191,7 +1333,10 @@ public class MainActivity extends Activity {
                 + "基于 github.com/agegr/pi-web 最新源码重构\n\n"
                 + "当前地址: " + serverUrl + "\n"
                 + "页面模式: " + (desktopMode ? "桌面版" : "移动版") + "\n"
-                + "日志文件: " + AppLog.filePath())
+                + "日志文件: " + AppLog.filePath() + "\n"
+                + "日志回传: " + Sync.status() + "\n"
+                + "回传候选: " + syncTargetsBrief() + "\n"
+                + "（单次超时 5s，最多 3 个候选，失败不重试）")
             .setPositiveButton("确定", null)
             .show();
     }
@@ -1323,7 +1468,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
-        Sync.flushLogs();
+        Sync.flushLogsNow();
         if (webView != null) webView.onPause();
         super.onPause();
     }

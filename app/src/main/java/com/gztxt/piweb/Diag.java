@@ -1,7 +1,6 @@
 package com.gztxt.piweb;
 
 import android.net.Uri;
-import android.util.Patterns;
 
 import java.io.IOException;
 import java.net.ConnectException;
@@ -13,6 +12,7 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.net.UnknownHostException;
+import java.util.regex.Pattern;
 
 import javax.net.ssl.SSLException;
 
@@ -166,10 +166,20 @@ public final class Diag {
         }
     }
 
+    /**
+     * IPv4 字面量正则。逐字节取自 Android API 34 的 android.util.Patterns.IP_ADDRESS_STRING
+     * （android-all jar 常量池，已机器比对 220 字符一致），内联以避开 API 23 起被标记的
+     * {@code Patterns.IP_ADDRESS}，不引入任何依赖、行为零变化。
+     * 注：该正则第一八位组缺 {@code |0}，故 "0.0.0.0" 按 Android 原行为判为非 IP，勿"顺手修正"。
+     */
+    private static final Pattern IP_V4 = Pattern.compile(
+        "((25[0-5]|2[0-4][0-9]|[0-1][0-9]{2}|[1-9][0-9]|[1-9])\\.(25[0-5]|2[0-4][0-9]|[0-1][0-9]{2}|[1-9][0-9]|[1-9]|0)\\."
+      + "(25[0-5]|2[0-4][0-9]|[0-1][0-9]{2}|[1-9][0-9]|[1-9]|0)\\.(25[0-5]|2[0-4][0-9]|[0-1][0-9]{2}|[1-9][0-9]|[0-9]))");
+
     private static boolean isIpLiteral(String host) {
         String h = stripBrackets(host);
         if (h.contains(":")) return true; // IPv6 字面量
-        return Patterns.IP_ADDRESS.matcher(h).matches();
+        return IP_V4.matcher(h).matches();
     }
 
     private static String stripBrackets(String host) {

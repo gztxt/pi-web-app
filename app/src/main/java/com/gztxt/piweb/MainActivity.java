@@ -11,7 +11,8 @@ import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.net.ConnectivityManager;
-import android.net.NetworkInfo;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -153,10 +154,9 @@ public class MainActivity extends Activity {
     private final BroadcastReceiver networkReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-            NetworkInfo info = cm == null ? null : cm.getActiveNetworkInfo();
-            boolean up = info != null && info.isConnected();
-            AppLog.i("Net", "网络状态变化: " + (up ? "已连接(" + info.getTypeName() + ")" : "断开"));
+            NetworkCapabilities caps = activeNetworkCaps();
+            boolean up = capsUsable(caps);
+            AppLog.i("Net", "网络状态变化: " + (up ? "已连接(" + transportName(caps) + ")" : "断开"));
             if (inError && up) {
                 toast("网络已恢复,重新连接…");
                 loadPiWeb("net");
@@ -1375,11 +1375,35 @@ public class MainActivity extends Activity {
         }
     }
 
-    private boolean isNetworkAvailable() {
+    /** 当前默认网络的 NetworkCapabilities；无网络 / 服务不可用时返回 null。 */
+    private NetworkCapabilities activeNetworkCaps() {
         ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-        if (cm == null) return false;
-        NetworkInfo info = cm.getActiveNetworkInfo();
-        return info != null && info.isConnected();
+        if (cm == null) return null;
+        Network n = cm.getActiveNetwork(); // API 23+，minSdk 24 满足
+        return n == null ? null : cm.getNetworkCapabilities(n);
+    }
+
+    /**
+     * 网络是否可用。取 NET_CAPABILITY_INTERNET 而非 VALIDATED：
+     * 本 App 连的是内网地址簿服务器，无外网的局域网永远拿不到 VALIDATED，
+     * 用它会把"能连上内网服务器"误判成断网，反而坏掉断网重连。
+     */
+    private static boolean capsUsable(NetworkCapabilities caps) {
+        return caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+    }
+
+    /** 对应旧 NetworkInfo.getTypeName() 的显示口径，保持日志可读性不变。 */
+    private static String transportName(NetworkCapabilities caps) {
+        if (caps == null) return "未知";
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return "WIFI";
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return "MOBILE";
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return "ETHERNET";
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return "VPN";
+        return "其他";
+    }
+
+    private boolean isNetworkAvailable() {
+        return capsUsable(activeNetworkCaps());
     }
 
     private int dp(int value) {

@@ -38,6 +38,10 @@ public class RoundRectDrawable extends Drawable {
         invalidateSelf();
     }
 
+    // Drawable.getOpacity() 自 API 23 起废弃，但仍是抽象方法必须实现；
+    // javac 对覆写废弃方法一律报 deprecation（与有无 @Override 无关），
+    // 故用 @SuppressWarnings 定点抑制。签名与实现不变，行为零变化。
+    @SuppressWarnings("deprecation")
     @Override
     public int getOpacity() {
         return PixelFormat.TRANSLUCENT;

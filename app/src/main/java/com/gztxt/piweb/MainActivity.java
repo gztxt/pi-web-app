@@ -76,7 +76,7 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_URL = "http://100.117.232.62:30141";
-    private static final String APP_VERSION = "2.8";
+    private static final String APP_VERSION = "2.9";
     private static final String PREFS = "piweb_prefs";
     private static final String PREF_URL = "server_url";
     private static final String PREF_BOOK = "server_book";
@@ -523,18 +523,11 @@ public class MainActivity extends Activity {
             // v2.6 支持 target="_blank" / window.open 新窗口
             @Override
             public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
-                final WebView child = new WebView(view.getContext());
-                child.setWebViewClient(new WebViewClient() {
-                    @Override
-                    public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest request) {
-                        String target = request.getUrl().toString();
-                        AppLog.i("Window", "target=_blank → 主视图加载: " + target);
-                        webView.loadUrl(target);
-                        return true;
-                    }
-                });
+                // 不创建子 WebView（每创建一个都不销毁会泄漏）；
+                // 目标页面已在主视图加载，直接通知引擎没有新窗口即可。
+                AppLog.i("Window", "target=_blank → 忽略（主视图已承载）");
                 WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
-                transport.setWebView(child);
+                transport.setWebView(null);
                 resultMsg.sendToTarget();
                 return true;
             }
@@ -831,7 +824,10 @@ public class MainActivity extends Activity {
             } finally {
                 syncLogGuard = false;
             }
-            if (diagDialogText != null) diagDialogText.append(line).append("\n");
+            if (diagDialogText != null) {
+                diagDialogText.append(line);
+                diagDialogText.append("\n");
+            }
             if (ok != syncLastOk) {
                 syncLastOk = ok;
                 toast(ok ? "日志回传已恢复" : "日志回传失败（π菜单→运行日志 查看）");

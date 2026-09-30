@@ -109,19 +109,21 @@ public final class Diag {
             cb.onDone("诊断结论: TCP 层失败 — 端口 " + port + " 超时无响应。"
                 + "主机不在线,或防火墙静默丢包(不是拒绝);"
                 + "检查服务器开机状态、防火墙与端口转发规则。");
-            return;
         } catch (ConnectException e) {
             long cost = now() - t1;
             cb.onLine("[3/4] TCP: ✗ 连接被拒 (cost=" + cost + "ms)");
             cb.onDone("诊断结论: TCP 层失败 — 主机 " + target.getHostAddress() + " 在线,"
                 + "但端口 " + port + " 拒绝连接 = pi-web 服务没运行(或监听在其他端口)。"
                 + "去服务器启动 pi-web。");
-            return;
         } catch (IOException e) {
             long cost = now() - t1;
             cb.onLine("[3/4] TCP: ✗ " + e.getClass().getSimpleName() + " (cost=" + cost + "ms)");
             cb.onDone("诊断结论: TCP 层失败 — " + e.getMessage());
-            return;
+        } finally {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+            }
         }
 
         // ── [4/4] HTTP ──

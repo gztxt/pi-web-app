@@ -137,9 +137,13 @@ public final class Sync {
         final int count = batch.size();
 
         new Thread(() -> {
-            Result r = attempt(cands, "POST", "/api/app-log/piweb/" + date, payload);
-            if (!r.ok) requeue(batch);           // 失败不丢数据
-            finishingFlush();
+            Result r;
+            try {
+                r = attempt(cands, "POST", "/api/app-log/piweb/" + date, payload);
+                if (!r.ok) requeue(batch);           // 失败不丢数据
+            } finally {
+                finishingFlush();
+            }
             publish(r, "日志 " + count + " 行");
         }, "piweb-sync-log").start();
     }
@@ -253,9 +257,16 @@ public final class Sync {
     }
 
     private static void appendErr(Result r, String seg) {
+        // 每段最长 60 字符 + " | " 分隔符，总计不超过 200 留尾空间
         if (r.errs.length() > 0) r.errs.append(" | ");
-        if (r.errs.length() > 160) r.errs.append("…");
-        else r.errs.append(seg);
+        if (r.errs.length() + seg.length() + 1 > 200) {
+            // 已超限：只加省略号不继续追加
+            r.errs.append("…");
+        } else {
+            // 截断当前段使其不突破 200
+            int remaining = 200 - r.errs.length();
+            r.errs.append(seg.length() > remaining ? seg.substring(0, remaining) : seg);
+        }
     }
 
     private static String brief(String base) {

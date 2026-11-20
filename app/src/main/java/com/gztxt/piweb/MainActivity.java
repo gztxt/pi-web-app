@@ -92,8 +92,6 @@ public class MainActivity extends Activity {
     private static final String PREF_DESKTOP = "desktop_mode";
     private static final String PREF_HINT = "hint_shown";
     private static final String PREF_SYNC = "sync_url";
-    /** 最后一层兜底：局域网固定地址。手机离开局域网即不可达，故只作候选清单末位。 */
-    private static final String DEFAULT_SYNC = "http://192.168.5.102:5002";
     private static final int SYNC_PORT = 5002;            // piweb-sync 监听端口
     private static final int SYNC_MAX_CANDIDATES = 3;     // 回传候选预算（硬上限）
     private static final String ERROR_BASE = "https://piweb.error/";
@@ -912,7 +910,8 @@ public class MainActivity extends Activity {
      * 有序候选清单（最多 3 个，Sync 侧每个只试 1 次、单次超时 ≤5s、失败不轮询）：
      *  1. 当前服务器派生 —— scheme://同主机:5002（在 Tailscale/外网时同样命中）
      *  2. 地址簿内另一主机派生（优先 Tailscale 100.64.0.0/10）
-     *  3. DEFAULT_SYNC 兜底常量
+     * v3.1 移除硬编码兜底 192.168.5.102:5002：连到陌生 WiFi 且同网段有别的机器时，
+     *      会把运行日志与地址簿 POST 给不认识的接收方；局域网场景由地址簿条目派生覆盖。
      * 向后兼容：用户在「同步设置」里显式填过值 → 用户值仍为首选（另补一条派生项防静默失联）；
      *          显式留空 → 关闭同步（保持 v2.7「留空=关闭」语义）。
      */
@@ -928,7 +927,6 @@ public class MainActivity extends Activity {
         }
         addCandidate(out, deriveSyncUrl(serverUrl));
         addCandidate(out, syncFromOtherBookEntry());
-        addCandidate(out, DEFAULT_SYNC);
         return out;
     }
 

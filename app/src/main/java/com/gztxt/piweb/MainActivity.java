@@ -622,7 +622,10 @@ public class MainActivity extends Activity {
      * 关闭路径只有「✕ / 返回键 / 页面 window.close() / onDestroy」,都走 closeChildWindow()。
      */
     private WebView openChildWindow() {
-        closeChildWindow();
+        // 由子窗口自身再 window.open 时,不能在自己的回调栈里 destroy 旧窗口:
+        // 先建新窗口,旧窗口(及其图层)延后到消息队列销毁。
+        final WebView previous = childWebView;
+        final FrameLayout previousLayer = childLayer;
         childLayer = new FrameLayout(this);
         childLayer.setBackgroundColor(C_BG);
         childWebView = new WebView(this);
@@ -646,6 +649,17 @@ public class MainActivity extends Activity {
 
         rootLayout.addView(childLayer, new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+        if (previous != null) {
+            handler.post(() -> {
+                if (previousLayer != null) rootLayout.removeView(previousLayer);
+                previous.stopLoading();
+                previous.clearHistory();
+                previous.removeAllViews();
+                previous.destroy();
+                AppLog.i("Window", "旧子窗口已销毁(嵌套 window.open)");
+            });
+        }
         return childWebView;
     }
 

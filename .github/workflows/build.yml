@@ -68,5 +68,5 @@ jobs:
           TAG="v$VER"
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --title "Pi Web $TAG" --notes "自动构建 ${GITHUB_SHA::7}"
-          gh release upload "$TAG" "app/build/outputs/apk/debug/app-debug.apk#PiWeb-$VER-debug.apk" --clobber
-          echo "下载: https://github.com/${{ github.repository }}/releases/download/$TAG/PiWeb-$VER-debug.apk"
+          gh release upload "$TAG" app/build/outputs/apk/debug/app-debug.apk --clobber
+          echo "下载: https://github.com/${{ github.repository }}/releases/download/$TAG/app-debug.apk"

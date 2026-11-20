@@ -26,6 +26,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.webkit.ConsoleMessage;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
 import android.webkit.URLUtil;
@@ -35,6 +36,7 @@ import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
+import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.ArrayAdapter;
@@ -56,8 +58,14 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.File;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 
 /**
  * Pi Web 安卓客户端 v2.0
@@ -77,7 +85,7 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_URL = "http://100.117.232.62:30141";
-    private static final String APP_VERSION = "3.0";
+    private static final String APP_VERSION = "3.1";
     private static final String PREFS = "piweb_prefs";
     private static final String PREF_URL = "server_url";
     private static final String PREF_BOOK = "server_book";
@@ -91,6 +99,7 @@ public class MainActivity extends Activity {
     private static final String ERROR_BASE = "https://piweb.error/";
     private static final int REQ_FILE_CHOOSER = 1001;
     private static final int AUTO_RETRY_SECONDS = 8;
+    private static final int AUTO_RETRY_MAX_SECONDS = 60;
 
     // pi-web 官方配色(暗色)
     private static final int C_BG = 0xFF1A1A1A;
@@ -122,8 +131,18 @@ public class MainActivity extends Activity {
     private boolean inError = false;         // 当前处于错误页
     private boolean pageError = false;       // 本次导航是否出错(防 onPageFinished 竞态)
     private int countdown = AUTO_RETRY_SECONDS;
+    private int retrySeconds = AUTO_RETRY_SECONDS;   // v3.1 指数退避(8→60s)
 
     private ValueCallback<Uri[]> uploadCallback;
+
+    // v3.1 target=_blank / window.open 子窗口(同一时刻只保留一个,关闭即销毁)
+    private FrameLayout childLayer;
+    private WebView childWebView;
+    private WebViewClient pageClient;
+    private WebChromeClient chromeClient;
+
+    // v3.1 同名下载自动改名(本次进程内已用过的名字)
+    private final Set<String> usedDownloadNames = new HashSet<>();
 
     // v2.4 诊断状态
     private boolean diagPending = false;   // 错误页渲染完成后自动诊断
@@ -140,7 +159,9 @@ public class MainActivity extends Activity {
             if (!inError) return;
             countdown--;
             if (countdown <= 0) {
-                AppLog.i("Retry", "倒计时结束,自动重试");
+                // v3.1 指数退避:服务器长时间不可达时不再每 8s 猛撞,封顶 60s
+                retrySeconds = Math.min(retrySeconds * 2, AUTO_RETRY_MAX_SECONDS);
+                AppLog.i("Retry", "倒计时结束,自动重试(下次间隔 " + retrySeconds + "s)");
                 loadPiWeb("auto");
                 return;
             }
@@ -362,7 +383,13 @@ public class MainActivity extends Activity {
     // -------------------------------------------------------------- WebView
 
     private void setupWebView() {
-        WebSettings s = webView.getSettings();
+        buildWebClients();
+        configureWebView(webView);
+    }
+
+    /** 主视图与子窗口共用同一套设置与客户端;客户端按 view 参数区分主/子。 */
+    private void configureWebView(WebView w) {
+        WebSettings s = w.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setDatabaseEnabled(true);
@@ -381,11 +408,11 @@ public class MainActivity extends Activity {
         // v2.6 支持 target=_blank 新窗口
         s.setSupportMultipleWindows(true);
         s.setJavaScriptCanOpenWindowsAutomatically(true);
-        defaultUserAgent = s.getUserAgentString();
-        applyUserAgent();
+        if (defaultUserAgent == null) defaultUserAgent = s.getUserAgentString();
+        applyUserAgentTo(w);
 
         // v2.6 下载监听器
-        webView.setDownloadListener(new DownloadListener() {
+        w.setDownloadListener(new DownloadListener() {
             @Override
             public void onDownloadStart(String url, String userAgent, String contentDisposition,
                                         String mimetype, long contentLength) {
@@ -404,7 +431,13 @@ public class MainActivity extends Activity {
             }
         });
 
-        webView.setWebViewClient(new WebViewClient() {
+        w.setWebViewClient(pageClient);
+        w.setWebChromeClient(chromeClient);
+    }
+
+    /** 客户端只建一次,主视图与子窗口共用;方法内的 view 参数区分主/子。 */
+    private void buildWebClients() {
+        pageClient = new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri uri = request.getUrl();
@@ -434,20 +467,20 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
-                pageError = false;
-                if (isRealPage(url)) {
-                    AppLog.i("Page", "开始加载 " + url);
-                    progressBar.setVisibility(View.VISIBLE);
-                    if (!firstLoadDone) {
-                        splashStatus.setText("正在连接 " + briefHost(url) + " …");
-                        splashView.setVisibility(View.VISIBLE);
-                    }
-                }
+                boolean main = (view == webView);
+                if (main) pageError = false;
+                if (!isRealPage(url)) return;
+                AppLog.i(main ? "Page" : "Window", "开始加载 " + url);
+                progressBar.setVisibility(View.VISIBLE);
+                if (!main || firstLoadDone) return;
+                splashStatus.setText("正在连接 " + briefHost(url) + " …");
+                splashView.setVisibility(View.VISIBLE);
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
                 progressBar.setVisibility(View.GONE);
+                if (view != webView) return;   // 子窗口不触碰主视图状态机
                 // 错误页渲染完成 → 触发自动诊断(v2.4)
                 if (url.startsWith(ERROR_BASE)) {
                     if (diagPending) {
@@ -463,6 +496,7 @@ public class MainActivity extends Activity {
                     boolean wasFirst = !firstLoadDone;
                     firstLoadDone = true;
                     inError = false;
+                    retrySeconds = AUTO_RETRY_SECONDS;   // 连接成功,退避归零
                     handler.removeCallbacksAndMessages(null);
                     splashView.setVisibility(View.GONE);
                     if (wasFirst) webView.setVisibility(View.VISIBLE);
@@ -473,8 +507,15 @@ public class MainActivity extends Activity {
             public void onReceivedError(WebView view, WebResourceRequest request,
                                         WebResourceError error) {
                 if (!request.isForMainFrame()) return;
-                pageError = true;
                 CharSequence desc = error.getDescription();
+                if (view != webView) {
+                    AppLog.e("Window", "子窗口加载失败 code=" + error.getErrorCode()
+                        + " desc=" + desc + " url=" + request.getUrl());
+                    toast("新窗口加载失败: " + error.getErrorCode());
+                    handler.post(() -> closeChildWindow());
+                    return;
+                }
+                pageError = true;
                 AppLog.e("Load", "主框架加载失败 code=" + error.getErrorCode()
                     + " desc=" + desc + " url=" + request.getUrl());
                 showErrorPage("网络错误 " + error.getErrorCode()
@@ -486,31 +527,55 @@ public class MainActivity extends Activity {
                                             WebResourceResponse errorResponse) {
                 if (!request.isForMainFrame()) return;
                 int code = errorResponse.getStatusCode();
-                if (code >= 500) {
+                if (view != webView) {
+                    AppLog.w("Window", "子窗口 HTTP " + code + " url=" + request.getUrl());
+                    return;
+                }
+                // v3.1 4xx 不再白屏:401/403(CCR token 缺失或鉴权拒绝)走错误页
+                if (code >= 500 || code == 401 || code == 403 || code == 407 || code == 429) {
                     pageError = true;
                     AppLog.e("Load", "HTTP " + code + " url=" + request.getUrl());
-                    showErrorPage("服务器错误 HTTP " + code);
+                    showErrorPage(httpDetail(code));
                 }
             }
-        });
+        };
 
-        webView.setWebChromeClient(new WebChromeClient() {
+        chromeClient = new WebChromeClient() {
             @Override
             public void onProgressChanged(WebView view, int newProgress) {
                 progressBar.setProgress(newProgress);
                 if (newProgress >= 100) progressBar.setVisibility(View.GONE);
             }
 
-            // pi-web 聊天图片附件(<input type="file" accept="image/*">)
+            // pi-web 聊天附件(<input type="file">):v3.1 不再写死 image/*,按页面 accept 放行任意类型
             @Override
             public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
                                              FileChooserParams params) {
-                AppLog.i("File", "打开文件选择器");
+                AppLog.i("File", "打开文件选择器 accept="
+                    + (params.getAcceptTypes() == null ? "-" : TextUtils.join(",", params.getAcceptTypes())));
                 if (uploadCallback != null) uploadCallback.onReceiveValue(null);
                 uploadCallback = callback;
                 try {
                     Intent intent = params.createIntent();
-                    intent.setType("image/*");
+                    List<String> mimes = new ArrayList<>();
+                    if (params.getAcceptTypes() != null) {
+                        for (String raw : params.getAcceptTypes()) {
+                            if (raw == null) continue;
+                            for (String part : raw.split(",")) {
+                                String t = part.trim();
+                                // EXTRA_MIME_TYPES 只接受 MIME;扩展名写法(如 .pdf)退回 */*
+                                if (t.contains("/") && !mimes.contains(t)) mimes.add(t);
+                            }
+                        }
+                    }
+                    if (mimes.isEmpty()) {
+                        intent.setType("*/*");
+                    } else if (mimes.size() == 1) {
+                        intent.setType(mimes.get(0));
+                    } else {
+                        intent.setType("*/*");
+                        intent.putExtra(Intent.EXTRA_MIME_TYPES, mimes.toArray(new String[0]));
+                    }
                     startActivityForResult(intent, REQ_FILE_CHOOSER);
                 } catch (Exception e) {
                     uploadCallback = null;
@@ -520,23 +585,106 @@ public class MainActivity extends Activity {
                 return true;
             }
 
-            // v2.6 支持 target="_blank" / window.open 新窗口
+            /** v3.1 JS 控制台消息入运行日志(白屏/脚本报错不再无迹可查);只收 W/E,避免正常日志刷屏。 */
             @Override
-            public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
-                // 不创建子 WebView（每创建一个都不销毁会泄漏）；
-                // 目标页面已在主视图加载，直接通知引擎没有新窗口即可。
-                AppLog.i("Window", "target=_blank → 忽略（主视图已承载）");
-                WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
-                transport.setWebView(null);
-                resultMsg.sendToTarget();
+            public boolean onConsoleMessage(ConsoleMessage cm) {
+                String line = cm.message() + " @" + cm.sourceId() + ":" + cm.lineNumber();
+                if (cm.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
+                    AppLog.e("JS", line);
+                } else if (cm.messageLevel() == ConsoleMessage.MessageLevel.WARNING) {
+                    AppLog.w("JS", line);
+                }
                 return true;
             }
-        });
+
+            /** 页面 window.close() → 销毁对应子窗口,避免残留空壳。 */
+            @Override
+            public void onCloseWindow(WebView window) {
+                if (window == childWebView) closeChildWindow();
+            }
+
+            // v3.1 target="_blank" / window.open:真正开子窗口(自带关闭按钮,关闭即销毁)
+            @Override
+            public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
+                WebView child = openChildWindow();
+                WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
+                transport.setWebView(child);
+                resultMsg.sendToTarget();
+                AppLog.i("Window", "target=_blank → 子窗口");
+                return true;
+            }
+        };
+    }
+
+    /**
+     * 创建一个覆盖全屏的子 WebView(同一时刻仅一个,旧的先销毁)。
+     * 注意:不设 WebViewClient 的 shouldOverrideUrlLoading 特判之外的额外生命周期,
+     * 关闭路径只有「✕ / 返回键 / 页面 window.close() / onDestroy」,都走 closeChildWindow()。
+     */
+    private WebView openChildWindow() {
+        closeChildWindow();
+        childLayer = new FrameLayout(this);
+        childLayer.setBackgroundColor(C_BG);
+        childWebView = new WebView(this);
+        childWebView.setBackgroundColor(C_BG);
+        configureWebView(childWebView);
+        childLayer.addView(childWebView, new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+        TextView close = new TextView(this);
+        close.setText("✕");
+        close.setTextColor(C_TEXT);
+        close.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        close.setGravity(Gravity.CENTER);
+        close.setBackground(new RoundRectDrawable(0xCC242424, dp(20)));
+        FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(dp(40), dp(40));
+        clp.gravity = Gravity.TOP | Gravity.END;
+        clp.topMargin = dp(12);
+        clp.rightMargin = dp(12);
+        close.setOnClickListener(v -> closeChildWindow());
+        childLayer.addView(close, clp);
+
+        rootLayout.addView(childLayer, new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        return childWebView;
+    }
+
+    /** 关闭并销毁子窗口;可重入(已关则无操作)。 */
+    private void closeChildWindow() {
+        WebView w = childWebView;
+        FrameLayout layer = childLayer;
+        childWebView = null;
+        childLayer = null;
+        if (layer != null) rootLayout.removeView(layer);
+        if (w != null) {
+            w.stopLoading();
+            w.clearHistory();
+            w.removeAllViews();
+            w.destroy();
+            AppLog.i("Window", "子窗口已关闭并销毁");
+        }
+    }
+
+    /** HTTP 状态 → 人话细节(错误页标题下展示)。 */
+    private static String httpDetail(int code) {
+        switch (code) {
+            case 401: return "HTTP 401 · 需要认证 — 地址可能缺 ?ccr_web_token=…,或会话已过期";
+            case 403: return "HTTP 403 · 拒绝访问 — 服务端白名单/鉴权不认这个来源";
+            case 407: return "HTTP 407 · 需要代理认证";
+            case 429: return "HTTP 429 · 请求过多 — 稍等再试";
+            default: return "服务器错误 HTTP " + code;
+        }
     }
 
     private void applyUserAgent() {
-        WebSettings s = webView.getSettings();
-        String ua = defaultUserAgent;
+        applyUserAgentTo(webView);
+        if (childWebView != null) applyUserAgentTo(childWebView);
+    }
+
+    private void applyUserAgentTo(WebView w) {
+        if (w == null) return;
+        WebSettings s = w.getSettings();
+        String ua = defaultUserAgent != null ? defaultUserAgent : s.getUserAgentString();
         if (desktopMode) {
             ua = ua.replace(" Mobile", "")
                 .replace(" wv) ", ") ")
@@ -551,6 +699,7 @@ public class MainActivity extends Activity {
 
     private void loadPiWeb(String trigger) {
         handler.removeCallbacksAndMessages(null);
+        if (!"auto".equals(trigger)) retrySeconds = AUTO_RETRY_SECONDS;
         inError = false;
         pageError = false;
         AppLog.i("Load", "加载 " + serverUrl + " (trigger=" + trigger + ")");
@@ -572,8 +721,8 @@ public class MainActivity extends Activity {
         String html = errorHtml(serverUrl, detail);
         webView.loadDataWithBaseURL(ERROR_BASE, html, "text/html", "UTF-8", null);
 
-        // 自动重试倒计时
-        countdown = AUTO_RETRY_SECONDS;
+        // 自动重试倒计时(v3.1:用当前退避间隔)
+        countdown = retrySeconds;
         handler.postDelayed(countdownTick, 1000);
     }
 
@@ -619,7 +768,7 @@ public class MainActivity extends Activity {
             + "<a class=\"btn primary\" href=\"piweb://retry\">立即重试</a>"
             + "<a class=\"btn ghost\" href=\"piweb://settings\">修改地址</a>"
             + "<a class=\"btn ghost\" href=\"piweb://diag\">重新诊断</a>"
-            + "<div class=\"cd\"><span id=\"cd\">" + AUTO_RETRY_SECONDS + "</span> 秒后自动重试…</div>"
+            + "<div class=\"cd\"><span id=\"cd\">" + retrySeconds + "</span> 秒后自动重试…</div>"
             + "</div></body></html>";
     }
 
@@ -658,6 +807,7 @@ public class MainActivity extends Activity {
         // 手风琴：设置（默认折叠）
         LinearLayout setBody = new LinearLayout(this);
         setBody.setOrientation(LinearLayout.VERTICAL);
+        setBody.addView(menuRow("清除缓存与 Cookie", this::confirmClearCache, dlg));
         setBody.addView(menuRow("运行日志", this::openLogDialog, dlg));
         setBody.addView(menuRow("网络诊断", this::openDiagDialog, dlg));
         setBody.addView(menuRow(desktopMode ? "桌面模式: 开 → 关" : "桌面模式: 关 → 开", () -> {
@@ -958,6 +1108,28 @@ public class MainActivity extends Activity {
             AppLog.w("Log", "分享失败: " + e);
             toast("无可用分享目标");
         }
+    }
+
+    /** v3.1 清缓存/Cookie/本地存储:诊断结论里承诺过,以前菜单里没有入口。 */
+    private void confirmClearCache() {
+        new AlertDialog.Builder(this)
+            .setTitle("清除缓存与 Cookie")
+            .setMessage("将清空网页缓存、Cookie 与本地存储。\n"
+                + "pi-web 的登录/会话状态会丢失,需要重新进入。\n\n确认清除?")
+            .setPositiveButton("清除", (d, w) -> {
+                webView.clearCache(true);
+                webView.clearFormData();
+                CookieManager cm = CookieManager.getInstance();
+                cm.removeAllCookies(null);
+                cm.flush();
+                WebStorage.getInstance().deleteAllData();
+                AppLog.i("Cache", "已清除缓存/Cookie/本地存储,重新加载");
+                toast("已清除,正在重新加载…");
+                firstLoadDone = false;
+                loadPiWeb("config");
+            })
+            .setNegativeButton("取消", null)
+            .show();
     }
 
     // ---------------------------------------------------------------- 诊断
@@ -1433,6 +1605,7 @@ public class MainActivity extends Activity {
     // -------------------------------------------------------------- 下载功能
 
     private void enqueueDownload(String url, String fileName, String mimetype) {
+        fileName = uniqueDownloadName(fileName);
         try {
             DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
             if (mimetype != null) req.setMimeType(mimetype);
@@ -1450,6 +1623,29 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             AppLog.e("Download", "下载失败: " + e);
             toast("下载失败: " + e.getMessage());
+        }
+    }
+
+    /** v3.1 同名文件已存在/本进程已用过 → 加时间戳,避免 DownloadManager 报 FILE_ALREADY_EXISTS。 */
+    private String uniqueDownloadName(String name) {
+        String safe = (name == null || name.trim().isEmpty()) ? "download.bin" : name.trim();
+        if (usedDownloadNames.contains(safe) || publicDownloadExists(safe)) {
+            int dot = safe.lastIndexOf('.');
+            String ts = new SimpleDateFormat("MMdd-HHmmss", Locale.US).format(new Date());
+            safe = dot > 0 ? safe.substring(0, dot) + "-" + ts + safe.substring(dot)
+                           : safe + "-" + ts;
+        }
+        usedDownloadNames.add(safe);
+        return safe;
+    }
+
+    @SuppressWarnings("deprecation")
+    private boolean publicDownloadExists(String name) {
+        try {
+            File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+            return new File(dir, name).exists();
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -1473,6 +1669,10 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        if (childWebView != null) {   // v3.1 子窗口优先关闭
+            closeChildWindow();
+            return;
+        }
         if (webView != null && webView.canGoBack()) {
             webView.goBack();
         } else {
@@ -1496,6 +1696,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
+        closeChildWindow();
         try {
             unregisterReceiver(networkReceiver);
         } catch (Exception ignored) {

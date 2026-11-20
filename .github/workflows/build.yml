@@ -10,6 +10,8 @@ on:
 
 jobs:
   build:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,3 +58,15 @@ jobs:
           name: pi-web-apk-v2
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
+
+      - name: Publish APK to Releases
+        if: github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER=$(grep -oP 'versionName\s+"\K[^"]+' app/build.gradle)
+          TAG="v$VER"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "Pi Web $TAG" --notes "自动构建 ${GITHUB_SHA::7}"
+          gh release upload "$TAG" "app/build/outputs/apk/debug/app-debug.apk#PiWeb-$VER-debug.apk" --clobber
+          echo "下载: https://github.com/${{ github.repository }}/releases/download/$TAG/PiWeb-$VER-debug.apk"

@@ -61,6 +61,7 @@ import org.json.JSONObject;
 import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
@@ -85,7 +86,7 @@ import java.util.Set;
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_URL = "http://100.117.232.62:30141";
-    private static final String APP_VERSION = "3.2";
+    private static final String APP_VERSION = "3.3";
     private static final String PREFS = "piweb_prefs";
     private static final String PREF_URL = "server_url";
     private static final String PREF_BOOK = "server_book";
@@ -550,6 +551,8 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 progressBar.setVisibility(View.GONE);
                 if (view != webView) {
+                    // v3.3 子窗口同样注入兼容补丁（补丁不能只依赖服务端 HTML 注入）
+                    if (isRealPage(url)) Compat.apply(view, "child");
                     // v3.2 子窗口也要采一次：白屏/卡死常发生在子窗口
                     if (isRealPage(url)) Probe.sample(view, "child", probeCb);
                     return;   // 子窗口不触碰主视图状态机
@@ -567,6 +570,8 @@ public class MainActivity extends Activity {
                 if (!pageError && isRealPage(url)) {
                     AppLog.i("Page", "加载完成 " + url);
                     subErrCount = 0;   // 新页面重新计数
+                    // v3.3 兼容补丁由 APP 自己注入：不依赖「这次导航是否取了桥的 HTML」
+                    Compat.apply(webView, "main");
                     // v3.2 页面侧状态采样：能否滑动/垫片是否装上/JS 异常全落日志
                     Probe.attach(webView, "main", probeCb);
                     boolean wasFirst = !firstLoadDone;
@@ -834,7 +839,10 @@ public class MainActivity extends Activity {
             splashStatus.setText("正在连接 " + briefHost(serverUrl) + " …");
             splashView.setVisibility(View.VISIBLE);
         }
-        webView.loadUrl(serverUrl);
+        // v3.3 强制主文档回源：桥对 HTML 已发 no-store，但实测切址后那次导航根本
+        // 没向桥取文档（hub 侧零 `[embed] 文档注入` 记录）⇒ 注入随文档一起丢。
+        // 带 no-cache 让每次导航都回源；静态资源仍由 pi-web 的 SW 缓存-first 供给。
+        webView.loadUrl(serverUrl, Collections.singletonMap("Cache-Control", "no-cache"));
     }
 
     private void showErrorPage(String detail) {

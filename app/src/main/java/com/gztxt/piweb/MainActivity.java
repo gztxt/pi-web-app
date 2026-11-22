@@ -61,7 +61,6 @@ import org.json.JSONObject;
 import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
@@ -86,7 +85,7 @@ import java.util.Set;
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_URL = "http://100.117.232.62:30141";
-    private static final String APP_VERSION = "3.3";
+    private static final String APP_VERSION = "3.1.1";
     private static final String PREFS = "piweb_prefs";
     private static final String PREF_URL = "server_url";
     private static final String PREF_BOOK = "server_book";
@@ -145,18 +144,6 @@ public class MainActivity extends Activity {
 
     // v2.4 诊断状态
     private boolean diagPending = false;   // 错误页渲染完成后自动诊断
-
-    // v3.2 运行状态探针（Probe.java）：把页面侧真实指标落日志，卡死/模型错误不再是黑盒
-    private final Probe.Cb probeCb = new Probe.Cb() {
-        @Override
-        public void onSample(String tag, String json) {
-            if (json == null || "null".equals(json)) return;
-            AppLog.i("State", tag + " " + json);
-        }
-    };
-    private long lagAt = 0;                // 主线程卡顿看门狗的上一拍
-    private long lastLagLog = 0;
-    private int subErrCount = 0;            // 子资源失败日志上限（防刷屏）
     private boolean diagRunning = false;   // 防止并发诊断
     private TextView diagDialogText;       // 菜单诊断对话框实时输出
 
@@ -214,8 +201,6 @@ public class MainActivity extends Activity {
             + " (API " + Build.VERSION.SDK_INT + ") | " + Build.MANUFACTURER + " " + Build.MODEL + " ====");
         AppLog.i("App", "地址: " + serverUrl + " | 桌面模式: " + desktopMode);
         AppLog.i("Book", "地址簿就绪: " + loadBook().size() + " 条");
-        logEnv();
-        startLagWatch();
 
         // 刘海屏延伸到内容区(API 28+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -395,63 +380,6 @@ public class MainActivity extends Activity {
 
     // -------------------------------------------------------------- WebView
 
-    /**
-     * v3.2 启动环境日志：卡死/模型错误事后要能回到「当时是什么环境」。
-     * 这些都是 Java 侧一眼可得的常量，成本极低；缺了就只能猜。
-     */
-    private void logEnv() {
-        try {
-            android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
-            AppLog.i("Env", "屏幕 " + dm.widthPixels + "x" + dm.heightPixels
-                + " density=" + dm.density + " dpi=" + dm.densityDpi
-                + " 竖屏=" + (getResources().getConfiguration().orientation == 1));
-            android.webkit.WebSettings ds =
-                new android.webkit.WebView(getApplicationContext()).getSettings();
-            AppLog.i("Env", "WebView UA: " + ds.getUserAgentString());
-        } catch (Throwable e) {
-            AppLog.w("Env", "环境日志失败: " + e);
-        }
-        try {
-            android.app.ActivityManager am =
-                (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
-            if (am != null) {
-                AppLog.i("Env", "内存类 memoryClass=" + am.getMemoryClass()
-                    + "MB largeMemoryClass=" + am.getLargeMemoryClass() + "MB");
-            }
-        } catch (Throwable e) {
-            AppLog.w("Env", "内存信息失败: " + e);
-        }
-        try {
-            android.content.pm.PackageInfo pi = getPackageManager()
-                .getPackageInfo(getPackageName(), 0);
-            AppLog.i("Env", "包 " + pi.packageName + " v" + pi.versionName
-                + " (code " + pi.versionCode + ")");
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /**
-     * v3.2 主线程卡顿看门狗：每 1s 打一拍，实际间隔超过 800ms 就落一行带毫秒数的日志。
-     * 「程序像卡死」与「只是慢」靠这一行就能分开，比让用户描述准。
-     */
-    private void startLagWatch() {
-        lagAt = System.currentTimeMillis();
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                long now = System.currentTimeMillis();
-                long gap = now - lagAt;
-                lagAt = now;
-                if (gap > 1800 && now - lastLagLog > 10000) {
-                    lastLagLog = now;
-                    AppLog.w("Lag", "主线程阻塞 " + (gap - 1000) + "ms（期望 1000ms 一拍）");
-                }
-                handler.postDelayed(this, 1000);
-            }
-        }, 1000);
-    }
-
-
     private void setupWebView() {
         buildWebClients();
         configureWebView(webView);
@@ -550,13 +478,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 progressBar.setVisibility(View.GONE);
-                if (view != webView) {
-                    // v3.3 子窗口同样注入兼容补丁（补丁不能只依赖服务端 HTML 注入）
-                    if (isRealPage(url)) Compat.apply(view, "child");
-                    // v3.2 子窗口也要采一次：白屏/卡死常发生在子窗口
-                    if (isRealPage(url)) Probe.sample(view, "child", probeCb);
-                    return;   // 子窗口不触碰主视图状态机
-                }
+                if (view != webView) return;   // 子窗口不触碰主视图状态机
                 // 错误页渲染完成 → 触发自动诊断(v2.4)
                 if (url.startsWith(ERROR_BASE)) {
                     if (diagPending) {
@@ -569,11 +491,6 @@ public class MainActivity extends Activity {
                 // 错误页(piweb.error)与中间页不会覆盖错误状态
                 if (!pageError && isRealPage(url)) {
                     AppLog.i("Page", "加载完成 " + url);
-                    subErrCount = 0;   // 新页面重新计数
-                    // v3.3 兼容补丁由 APP 自己注入：不依赖「这次导航是否取了桥的 HTML」
-                    Compat.apply(webView, "main");
-                    // v3.2 页面侧状态采样：能否滑动/垫片是否装上/JS 异常全落日志
-                    Probe.attach(webView, "main", probeCb);
                     boolean wasFirst = !firstLoadDone;
                     firstLoadDone = true;
                     inError = false;
@@ -587,14 +504,7 @@ public class MainActivity extends Activity {
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request,
                                         WebResourceError error) {
-                if (!request.isForMainFrame()) {
-                    if (subErrCount < 30) {
-                        subErrCount++;
-                        AppLog.w("Net", "子资源失败 code=" + error.getErrorCode()
-                            + " " + request.getUrl());
-                    }
-                    return;
-                }
+                if (!request.isForMainFrame()) return;
                 CharSequence desc = error.getDescription();
                 if (view != webView) {
                     AppLog.e("Window", "子窗口加载失败 code=" + error.getErrorCode()
@@ -613,15 +523,8 @@ public class MainActivity extends Activity {
             @Override
             public void onReceivedHttpError(WebView view, WebResourceRequest request,
                                             WebResourceResponse errorResponse) {
+                if (!request.isForMainFrame()) return;
                 int code = errorResponse.getStatusCode();
-                if (!request.isForMainFrame()) {
-                    // v3.2 子资源失败也要留痕：页面卡死常伴随某个 chunk/api 挂了
-                    if (code >= 400 && subErrCount < 30) {
-                        subErrCount++;
-                        AppLog.w("Net", "子资源 HTTP " + code + " " + request.getUrl());
-                    }
-                    return;
-                }
                 if (view != webView) {
                     AppLog.w("Window", "子窗口 HTTP " + code + " url=" + request.getUrl());
                     return;
@@ -632,29 +535,6 @@ public class MainActivity extends Activity {
                     AppLog.e("Load", "HTTP " + code + " url=" + request.getUrl());
                     showErrorPage(httpDetail(code));
                 }
-            }
-
-            /**
-             * v3.2 渲染进程死亡（WebView 的 JS/渲染进程被系统 OOM kill 或崩溃）。
-             * 症状就是「页面突然划不动 + 任何操作无反应」，以前日志里一个字都没有；
-             * 必须单独记为 E/Page，它和「JS 报错」是两类完全不同的故障。
-             */
-            @Override
-            public boolean onRenderProcessGone(WebView view, android.webkit.RenderProcessGoneDetail d) {
-                boolean crash = (d != null && d.didCrash());
-                AppLog.e("Page", "渲染进程死亡 crashed=" + crash
-                    + " oom=" + (crash ? "否" : "是")
-                    + " url=" + (view == null ? "-" : view.getUrl()));
-                if (view != null && view == webView) {
-                    handler.post(() -> {
-                        try {
-                            toast(crash ? "页面渲染进程崩溃，正在重开" : "内存不足，页面被回收，正在重开");
-                            recreate();
-                        } catch (Throwable ignored) {
-                        }
-                    });
-                }
-                return true;   // 已自行处理，否则进程会被直接杀掉
             }
         };
 
@@ -839,10 +719,7 @@ public class MainActivity extends Activity {
             splashStatus.setText("正在连接 " + briefHost(serverUrl) + " …");
             splashView.setVisibility(View.VISIBLE);
         }
-        // v3.3 强制主文档回源：桥对 HTML 已发 no-store，但实测切址后那次导航根本
-        // 没向桥取文档（hub 侧零 `[embed] 文档注入` 记录）⇒ 注入随文档一起丢。
-        // 带 no-cache 让每次导航都回源；静态资源仍由 pi-web 的 SW 缓存-first 供给。
-        webView.loadUrl(serverUrl, Collections.singletonMap("Cache-Control", "no-cache"));
+        webView.loadUrl(serverUrl);
     }
 
     private void showErrorPage(String detail) {

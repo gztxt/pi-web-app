@@ -10,8 +10,10 @@ android {
         applicationId "com.gztxt.piweb"
         minSdk 24
         targetSdk 34
-        versionCode 14
-        versionName "3.3"
+        // 2026-11-22 回退到 v3.1 代码：versionCode 必须继续单调递增，
+        // 否则手机上（已装 code 14）无法覆盖安装，只能卸载重装。
+        versionCode 15
+        versionName "3.1.1"
     }
 
     def ksPath = System.getenv("PIWEB_KEYSTORE")

@@ -55,6 +55,7 @@ public final class Sync {
     private static final List<String> PENDING = new ArrayList<>();
     private static final List<String> CANDIDATES = new ArrayList<>();
     private static String status = "尚未尝试";
+    private static volatile String lastOkHost = "";   // 最近一次成功的回传地址（APP 持久化后兜底复用）
     private static StatusListener listener;
     private static long lastFlushAt = 0;
     private static boolean flushing = false;
@@ -191,6 +192,37 @@ public final class Sync {
         }, "piweb-sync-pull").start();
     }
 
+    /**
+     * 2026-11-23 地址簿历史备份：列服务器上按日期存档的版本。
+     * 服务端每次写入前把旧值存进 history/（保留 30 份），所以这里拿到的是「带日期的备份清单」。
+     */
+    public static void listBookHistory(final Callback cb) {
+        final List<String> cands = snapshot();
+        if (cands.isEmpty()) { if (cb != null) cb.onResult(false, null); return; }
+        new Thread(() -> {
+            Result r = attempt(cands, "GET", "/api/kv/piweb-book/history", null);
+            if (cb != null) cb.onResult(r.ok, r.body);
+            publish(r, "备份清单");
+        }, "piweb-sync-hist").start();
+    }
+
+    /** 按日期戳恢复某个历史备份（服务端会先把当前值再存档一份，恢复本身也可回滚）。 */
+    public static void restoreBookStamp(final String stamp, final Callback cb) {
+        final List<String> cands = snapshot();
+        if (cands.isEmpty() || stamp == null || stamp.isEmpty()) {
+            if (cb != null) cb.onResult(false, null);
+            return;
+        }
+        new Thread(() -> {
+            Result r = attempt(cands, "POST", "/api/kv/piweb-book/restore/" + stamp, "{}");
+            if (cb != null) cb.onResult(r.ok, r.body);
+            publish(r, "恢复到 " + stamp);
+        }, "piweb-sync-restore").start();
+    }
+
+    /** 最近一次成功的回传地址（空串 = 还没成功过）。 */
+    public static String lastOkHost() { return lastOkHost; }
+
     private static synchronized List<String> snapshot() { return new ArrayList<>(CANDIDATES); }
 
     // ── HTTP：按候选清单依次尝试（每个 1 次，最多 3 个）────
@@ -278,6 +310,7 @@ public final class Sync {
     private static synchronized void publish(Result r, String what) {
         String line;
         if (r.ok) {
+            lastOkHost = r.host;
             line = "回传正常 · " + what + " → " + r.host + " (HTTP " + r.code
                 + ", " + r.cost + "ms, 候选" + (r.usedIndex + 1) + "/" + r.total + ")";
         } else if (r.total == 0) {

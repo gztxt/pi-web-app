@@ -85,13 +85,17 @@ import java.util.Set;
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_URL = "http://100.117.232.62:30141";
-    private static final String APP_VERSION = "3.1.1";
+    private static final String APP_VERSION = "3.1.2";
     private static final String PREFS = "piweb_prefs";
     private static final String PREF_URL = "server_url";
     private static final String PREF_BOOK = "server_book";
     private static final String PREF_DESKTOP = "desktop_mode";
     private static final String PREF_HINT = "hint_shown";
     private static final String PREF_SYNC = "sync_url";
+    /** 最近一次成功的回传地址（v3.1.2）：漫游到别的网络时，它可能是唯一可达的那条。 */
+    private static final String PREF_SYNC_LAST = "sync_last_ok";
+    /** 地址簿上次备份成功的本地时间戳（仅用于界面显示，权威时间在服务端）。 */
+    private static final String PREF_BOOK_AT = "book_backup_at";
     private static final int SYNC_PORT = 5002;            // piweb-sync 监听端口
     private static final int SYNC_MAX_CANDIDATES = 3;     // 回传候选预算（硬上限）
     private static final String ERROR_BASE = "https://piweb.error/";
@@ -176,6 +180,9 @@ public class MainActivity extends Activity {
             NetworkCapabilities caps = activeNetworkCaps();
             boolean up = capsUsable(caps);
             AppLog.i("Net", "网络状态变化: " + (up ? "已连接(" + transportName(caps) + ")" : "断开"));
+            // v3.1.2：切网后立刻重投一次待发日志。旧行为只靠「攺够 20 行/切后台」，
+            // 手机上从 WiFi 换到流量后要等很久才重试，看着就像回传坏了。
+            if (up) Sync.flushLogsNow();
             if (inError && up) {
                 toast("网络已恢复,重新连接…");
                 loadPiWeb("net");
@@ -201,6 +208,9 @@ public class MainActivity extends Activity {
             + " (API " + Build.VERSION.SDK_INT + ") | " + Build.MANUFACTURER + " " + Build.MODEL + " ====");
         AppLog.i("App", "地址: " + serverUrl + " | 桌面模式: " + desktopMode);
         AppLog.i("Book", "地址簿就绪: " + loadBook().size() + " 条");
+        // v3.1.2：服务器备份以「正在运行的 APP 的实际地址簿」为准 —— 启动即推送一次，
+        // 不用等用户编辑条目。空簿不推（服务端也会拒收空簿覆盖）。
+        autoBackupBook("启动");
 
         // 刘海屏延伸到内容区(API 28+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -835,7 +845,8 @@ public class MainActivity extends Activity {
             catch (Exception e) { toast("没有可用的浏览器"); }
         }, dlg));
         setBody.addView(menuRow("同步设置…", this::openSyncDialog, dlg));
-        setBody.addView(menuRow("从服务器恢复地址簿", this::restoreBook, dlg));
+        setBody.addView(menuRow("备份地址簿到服务器", () -> backupBookNow(), dlg));
+        setBody.addView(menuRow("从服务器恢复地址簿…", () -> { dlg[0].dismiss(); openRestoreBookDialog(); }, dlg));
         setBody.addView(menuRow("关于", this::showAbout, dlg));
         root.addView(menuHeader("⚙️ 设置", setBody, false));
         root.addView(setBody);
@@ -909,10 +920,12 @@ public class MainActivity extends Activity {
     /**
      * 有序候选清单（最多 3 个，Sync 侧每个只试 1 次、单次超时 ≤5s、失败不轮询）：
      *  1. 当前服务器派生 —— scheme://同主机:5002（在 Tailscale/外网时同样命中）
-     *  2. 地址簿内另一主机派生（优先 Tailscale 100.64.0.0/10）
+     *  2. 地址簿内**其它每个主机**派生项（Tailscale 优先）—— v3.1.2 起不再只取 1 条：
+     *     地址簿里有 3 个不同主机时，旧实现只试到 1 条备用，蹮中的那条挂了就无路可走。
+     *  3. 上次成功的回传地址（持久化）—— 漫游到「当前服务器不可达但旧地址能通」的网络时救场。
      * v3.1 移除硬编码兜底 192.168.5.102:5002：连到陌生 WiFi 且同网段有别的机器时，
-     *      会把运行日志与地址簿 POST 给不认识的接收方；局域网场景由地址簿条目派生覆盖。
-     * 向后兼容：用户在「同步设置」里显式填过值 → 用户值仍为首选（另补一条派生项防静默失联）；
+     *      会把运行日志与地址簿 POST 给不认识的接收方；地址簿派生项不在此限（户主自己的地址）。
+     * 向后兼容：用户在「同步设置」里显式填过值 → 用户值仍为首选（另补派生项防静默失联）；
      *          显式留空 → 关闭同步（保持 v2.7「留空=关闭」语义）。
      */
     private List<String> syncCandidates() {
@@ -923,11 +936,34 @@ public class MainActivity extends Activity {
             if (m.isEmpty()) return out;
             addCandidate(out, m);
             addCandidate(out, deriveSyncUrl(serverUrl));
+            addBookCandidates(out);
+            addCandidate(out, prefs.getString(PREF_SYNC_LAST, null));
             return out;
         }
         addCandidate(out, deriveSyncUrl(serverUrl));
-        addCandidate(out, syncFromOtherBookEntry());
+        addBookCandidates(out);
+        addCandidate(out, prefs.getString(PREF_SYNC_LAST, null));
         return out;
+    }
+
+    /** 地址簿里每个不同主机的派生项都入候选（Tailscale 主机优先），总上限仍由 addCandidate 把。 */
+    private void addBookCandidates(List<String> out) {
+        String cur = hostOf(serverUrl);
+        List<String> tail = new ArrayList<>();
+        List<String> other = new ArrayList<>();
+        for (BookEntry e : loadBook()) {
+            String h = hostOf(e.url);
+            if (h == null || h.equals(cur)) continue;
+            String d = deriveSyncUrl(e.url);
+            if (d == null) continue;
+            if (isTailscale(h)) {
+                if (!tail.contains(d)) tail.add(d);
+            } else if (!other.contains(d)) {
+                other.add(d);
+            }
+        }
+        for (String d : tail) addCandidate(out, d);
+        for (String d : other) addCandidate(out, d);
     }
 
     private void addCandidate(List<String> list, String url) {
@@ -948,19 +984,6 @@ public class MainActivity extends Activity {
         String scheme = uri.getScheme() == null ? "http" : uri.getScheme();
         if (host.indexOf(':') >= 0 && !host.startsWith("[")) host = "[" + host + "]";
         return scheme + "://" + host + ":" + SYNC_PORT;
-    }
-
-    /** 地址簿中第一个「与当前服务器不同主机」的条目（Tailscale 优先）派生出的回传地址。 */
-    private String syncFromOtherBookEntry() {
-        String cur = hostOf(serverUrl);
-        String fallback = null;
-        for (BookEntry e : loadBook()) {
-            String h = hostOf(e.url);
-            if (h == null || h.equals(cur)) continue;
-            if (isTailscale(h)) return deriveSyncUrl(e.url);
-            if (fallback == null) fallback = e.url;
-        }
-        return deriveSyncUrl(fallback);
     }
 
     private static String hostOf(String url) {
@@ -989,6 +1012,12 @@ public class MainActivity extends Activity {
             if (diagDialogText != null) {
                 diagDialogText.append(line);
                 diagDialogText.append("\n");
+            }
+            if (ok) {
+                String host = Sync.lastOkHost();
+                if (!host.isEmpty() && !host.equals(prefs.getString(PREF_SYNC_LAST, null))) {
+                    prefs.edit().putString(PREF_SYNC_LAST, host).apply();
+                }
             }
             if (ok != syncLastOk) {
                 syncLastOk = ok;
@@ -1028,7 +1057,8 @@ public class MainActivity extends Activity {
             .setMessage("地址簿与运行日志回传到此服务器的 piweb-sync（端口 " + SYNC_PORT + "）。\n"
                 + "当前模式: " + (auto ? "自动（跟随当前服务器，候选见下）" : "手动") + "\n"
                 + "候选清单:\n" + syncTargetsBrief() + "\n"
-                + "最近状态: " + Sync.status() + "\n\n"
+                + "最近状态: " + Sync.status() + "\n"
+                + "地址簿上次备份: " + lastBookBackupAt() + "（服务器保留最近 30 份，可在「从服务器恢复地址簿」里按日期回）\n\n"
                 + "手动填写后优先用该地址（仍会补一条当前服务器派生项）；留空=关闭同步；「改为自动」恢复跟随当前服务器。")
             .setView(c)
             .setPositiveButton("保存", (d, w) -> {
@@ -1046,33 +1076,123 @@ public class MainActivity extends Activity {
             .show();
     }
 
-    /** 从服务器恢复地址簿。 */
-    private void restoreBook() {
+    /** π 菜单 → 显式备份：把当前 APP 里的地址簿推到服务器（服务端自动留历史版本）。 */
+    private void backupBookNow() {
         if (!Sync.enabled()) { toast("同步已关闭：π菜单→同步设置→改为自动"); return; }
-        toast("正在从服务器恢复…");
-        Sync.pullBook((ok, body) -> runOnUiThread(() -> {
-            if (!ok || body == null) { toast("恢复失败：服务器不可达或无备份"); return; }
+        List<BookEntry> list = loadBook();
+        if (list.isEmpty()) { toast("地址簿为空，无需备份"); return; }
+        Sync.pushBook(bookJson(list));
+        prefs.edit().putString(PREF_BOOK_AT, nowStamp()).apply();
+        AppLog.i("Book", "手动备份地址簿: " + list.size() + " 条 → 服务器");
+        toast("已提交备份（" + list.size() + " 条），结果看运行日志");
+    }
+
+    /** 启动时静默备份：服务器副本以「正在运行的 APP 的实际地址簿」为准。 */
+    private void autoBackupBook(String trigger) {
+        if (!Sync.enabled()) return;
+        List<BookEntry> list = loadBook();
+        if (list.isEmpty()) return;
+        Sync.pushBook(bookJson(list));
+        prefs.edit().putString(PREF_BOOK_AT, nowStamp()).apply();
+        AppLog.i("Book", "地址簿自动备份(" + trigger + "): " + list.size() + " 条");
+    }
+
+    private static String nowStamp() {
+        return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
+    }
+
+    /** 本地记录的上次备份时间（服务端还存了权威 savedAt，这里只用于对话框展示）。 */
+    private String lastBookBackupAt() {
+        String at = prefs.getString(PREF_BOOK_AT, null);
+        return (at == null || at.isEmpty()) ? "从未" : at;
+    }
+
+    private static String bookJson(List<BookEntry> list) {
+        JSONArray arr = new JSONArray();
+        try {
+            for (BookEntry e : list) {
+                JSONObject o = new JSONObject();
+                o.put("name", e.name);
+                o.put("url", e.url);
+                arr.put(o);
+            }
+        } catch (Exception ignored) {
+        }
+        return arr.toString();
+    }
+
+    /** 恢复：先拉服务器上的带日期备份清单，选一个日期再恢复。 */
+    private void openRestoreBookDialog() {
+        if (!Sync.enabled()) { toast("同步已关闭：π菜单→同步设置→改为自动"); return; }
+        toast("正在读取服务器备份清单…");
+        Sync.listBookHistory((ok, body) -> runOnUiThread(() -> {
+            if (!ok || body == null) { toast("读取失败：服务器不可达"); return; }
+            final List<String[]> rows = new ArrayList<>();   // {stamp, label}
             try {
                 JSONObject resp = new JSONObject(body);
-                JSONObject data = resp.optJSONObject("data");
-                JSONArray arr = data == null ? null : data.optJSONArray("book");
-                if (arr == null || arr.length() == 0) { toast("服务器上没有地址簿备份"); return; }
-                List<BookEntry> list = new ArrayList<>();
-                for (int i = 0; i < arr.length(); i++) {
+                JSONArray arr = resp.optJSONArray("data");
+                for (int i = 0; arr != null && i < arr.length(); i++) {
                     JSONObject o = arr.getJSONObject(i);
-                    String name = o.optString("name", "").trim();
-                    String url = o.optString("url", "").trim();
-                    if (!name.isEmpty() && !url.isEmpty()) list.add(new BookEntry(name, url));
+                    String stamp = o.optString("stamp", "");
+                    if (stamp.isEmpty()) continue;
+                    int cnt = o.optInt("count", -1);
+                    rows.add(new String[]{stamp, o.optString("savedAt", stamp)
+                        + (cnt >= 0 ? " · " + cnt + " 条" : "")});
                 }
-                if (list.isEmpty()) { toast("备份为空"); return; }
-                saveBook(list);
-                AppLog.i("Sync", "从服务器恢复地址簿: " + list.size() + " 条");
-                applySyncTargets("恢复地址簿");
-                toast("已恢复 " + list.size() + " 个地址");
             } catch (Exception e) {
-                toast("恢复失败: " + e.getMessage());
+                toast("清单解析失败: " + e.getMessage());
+                return;
             }
+            if (rows.isEmpty()) {
+                toast("服务器上还没有历史备份（下次改地址簿就会生成）");
+                return;
+            }
+            String[] labels = new String[rows.size()];
+            for (int i = 0; i < rows.size(); i++) labels[i] = rows.get(i)[1];
+            new AlertDialog.Builder(this)
+                .setTitle("选择备份日期")
+                .setItems(labels, (d, which) -> restoreFromStamp(rows.get(which)[0], labels[which]))
+                .setNegativeButton("取消", null)
+                .show();
         }));
+    }
+
+    private void restoreFromStamp(String stamp, String label) {
+        toast("正在恢复 " + label + " …");
+        Sync.restoreBookStamp(stamp, (ok, body) -> runOnUiThread(() -> {
+            if (!ok) { toast("恢复失败：服务器不可达或该备份不存在"); return; }
+            Sync.pullBook((ok2, body2) -> runOnUiThread(() -> {
+                if (!ok2) { toast("已恢复，但重新读取失败"); return; }
+                int n = applyBookJson(body2);
+                if (n <= 0) { toast("恢复后地址簿为空，请换一个日期"); return; }
+                AppLog.i("Book", "按日期恢复地址簿: " + label + " → " + n + " 条");
+                applySyncTargets("恢复地址簿");
+                toast("已恢复 " + n + " 个地址（" + label + "）");
+            }));
+        }));
+    }
+
+    /** 把 pullBook 的响应体写进本地地址簿，返回条数（0＝空/无法解析）。不回推，避免自我循环。 */
+    private int applyBookJson(String body) {
+        try {
+            JSONObject resp = new JSONObject(body);
+            JSONObject data = resp.optJSONObject("data");
+            JSONArray arr = data == null ? null : data.optJSONArray("book");
+            if (arr == null || arr.length() == 0) return 0;
+            List<BookEntry> list = new ArrayList<>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                String name = o.optString("name", "").trim();
+                String url = o.optString("url", "").trim();
+                if (!name.isEmpty() && !url.isEmpty()) list.add(new BookEntry(name, url));
+            }
+            if (list.isEmpty()) return 0;
+            saveBook(list, false);
+            return list.size();
+        } catch (Exception e) {
+            AppLog.w("Book", "恢复解析失败: " + e);
+            return 0;
+        }
     }
 
     private String currentServiceName(List<BookEntry> book) {
@@ -1313,6 +1433,11 @@ public class MainActivity extends Activity {
     }
 
     private void saveBook(List<BookEntry> list) {
+        saveBook(list, true);
+    }
+
+    /** push=false 用于「刚从服务器恢复」，避免把刚读到的同一份内容再推回服务端。 */
+    private void saveBook(List<BookEntry> list, boolean push) {
         JSONArray arr = new JSONArray();
         try {
             for (BookEntry e : list) {
@@ -1324,7 +1449,7 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {
         }
         prefs.edit().putString(PREF_BOOK, arr.toString()).apply();
-        Sync.pushBook(arr.toString());
+        if (push) Sync.pushBook(arr.toString());
     }
 
     /** v2.5 首次启动迁移: 把已有地址存为地址簿首条 "Pi Web"。 */
